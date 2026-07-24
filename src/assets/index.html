@@ -656,7 +656,7 @@
             <span>codebase-retrieval</span>
           </label>
           <label class="flex items-center gap-2 text-sm text-gray-700 dark:text-wiki-text cursor-pointer">
-            <input id="mcp-tool-file-retrieval" type="checkbox" checked
+            <input id="mcp-tool-file-retrieval" type="checkbox"
                    class="h-4 w-4 rounded border-gray-300 dark:border-wiki-border text-blue-600
                           focus:outline-none focus:ring-2 focus:ring-blue-400" />
             <span>file-retrieval</span>
@@ -2216,7 +2216,7 @@ function renderAll() {
   });
   document.getElementById('banner-setup').classList.toggle('hidden', !needsSetup());
   // MCP tools checkboxes
-  const enabledTools = cfg.enabled_mcp_tools || ['codebase-retrieval', 'file-retrieval'];
+  const enabledTools = cfg.enabled_mcp_tools || ['codebase-retrieval'];
   document.getElementById('mcp-tool-codebase-retrieval').checked = enabledTools.includes('codebase-retrieval');
   document.getElementById('mcp-tool-file-retrieval').checked = enabledTools.includes('file-retrieval');
   // Custom extensions
@@ -3574,7 +3574,7 @@ function buildOpencodeConfigSnippet(endpointUrl) {
 }
 
 function buildClaudeMdSnippet() {
-  const enabled = (cfg && cfg.enabled_mcp_tools) || ['codebase-retrieval', 'file-retrieval'];
+  const enabled = (cfg && cfg.enabled_mcp_tools) || ['codebase-retrieval'];
   const lines = [
     '# CLAUDE.md',
     '',

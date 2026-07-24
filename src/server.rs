@@ -1348,13 +1348,16 @@ async fn post_mcp_setup(
     };
 
     // Repo must be a configured repo — never write into an arbitrary path.
-    {
+    // Capture the same enabled_mcp_tools list used by MCP runtime construction
+    // so generated prompt guidance never advertises a disabled tool.
+    let enabled_tools = {
         let settings = state.settings.read().await;
         if !settings.repos.contains(&repo) {
             let body = json!({ "error": "repo not found" });
             return (StatusCode::NOT_FOUND, Json(body)).into_response();
         }
-    }
+        settings.enabled_mcp_tools.clone()
+    };
 
     // The URL must be THIS repo's own MCP endpoint. We accept any scheme/host
     // (reverse proxies are valid) but the path must end with the repo's
@@ -1378,7 +1381,7 @@ async fn post_mcp_setup(
     let repo_root = PathBuf::from(&repo);
     let endpoint_url = req.endpoint_url.clone();
     let actions = match tokio::task::spawn_blocking(move || {
-        crate::mcp_setup::run_setup(&repo_root, target, &endpoint_url)
+        crate::mcp_setup::run_setup(&repo_root, target, &endpoint_url, &enabled_tools)
     })
     .await
     {
