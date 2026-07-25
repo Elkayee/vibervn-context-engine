@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use surrealdb::Surreal;
 use surrealdb::engine::local::Db;
@@ -20,15 +20,14 @@ use rmcp::{
     schemars, tool, tool_handler, tool_router,
 };
 
-mod readiness;
+pub(crate) mod query_gate;
+pub(crate) mod readiness;
 #[cfg(test)]
 mod tests;
 
-use readiness::{MCP_INDEX_POLL_INTERVAL, RepoIndexState};
-
 use crate::config::Settings;
 use crate::embedding::voyage::VoyageClient;
-use crate::indexing::{IndexEngine, IndexPhase, IndexState, RepoStatus};
+use crate::indexing::IndexEngine;
 use crate::llm::LlmClient;
 use crate::query::engine::QueryGraphMode;
 use crate::store;
@@ -564,34 +563,6 @@ fn select_empty_or_warming_message(
     format!("No results found for: {information_request}")
 }
 
-fn is_resolve_edges_status(status: Option<&RepoStatus>) -> bool {
-    status.is_some_and(|s| s.state == IndexState::Indexing && s.phase == IndexPhase::ResolveEdges)
-}
-
-async fn do_vector_only_query(
-    index_engine: &Arc<IndexEngine>,
-    repo_dbs: &Arc<RwLock<HashMap<String, Surreal<Db>>>>,
-    settings: &Settings,
-    information_request: &str,
-    repo: &str,
-) -> String {
-    let prefix = "(index is resolving the call graph; showing vector-only results without callers/callees)\n\n";
-    format!(
-        "{}{}",
-        prefix,
-        do_query(
-            index_engine,
-            repo_dbs,
-            settings,
-            information_request,
-            repo,
-            QueryGraphMode::VectorOnly,
-            Duration::ZERO,
-        )
-        .await
-    )
-}
-
 pub async fn run_codebase_retrieval(
     home_dir: &Path,
     data_dir: &Path,
@@ -649,136 +620,46 @@ pub async fn run_codebase_retrieval(
             .to_string();
     }
 
-    // 4. Open the repo DB and determine freshness from durable state.
-    let db =
-        match store::get_or_open(repo_dbs, data_dir, repo, settings.repo_generation(repo)).await {
-            Ok(d) => d,
-            Err(e) => {
-                return format!("Error: could not open index database: {e}");
-            }
-        };
-
-    let chunk_count = store::ops::count_chunks(&db).await.unwrap_or(0);
-    let last_indexed_ts = store::ops::get_meta(&db, "last_indexed_at")
-        .await
-        .unwrap_or(None);
-
-    let stale_threshold = chrono::Duration::days(settings.mcp_stale_after_days as i64);
-
-    let current_status = index_engine.repo_status(repo).await;
-    let run_state_is_indexing = current_status
-        .as_ref()
-        .map(|s| s.state == IndexState::Indexing)
-        .unwrap_or(false);
-    let readiness = readiness::evaluate(
-        &RepoIndexState {
-            run_state_is_indexing,
-            repo_is_mutating: index_engine.repo_is_mutating(repo).await,
-            chunk_count,
-            last_indexed_ts: last_indexed_ts.as_deref(),
-        },
-        stale_threshold,
-    );
-
-    // 5. Check in-flight indexing state and trigger if needed.
-    if is_resolve_edges_status(current_status.as_ref()) {
-        return do_vector_only_query(index_engine, repo_dbs, settings, information_request, repo)
-            .await;
-    }
-
-    if readiness.requires_trigger() {
-        let _ = index_engine.trigger_index(repo).await;
-    }
-    let need_wait = readiness.requires_wait();
-
-    let default_warm_wait = Duration::from_secs(settings.mcp_index_wait_secs);
-    let mut query_warm_wait = default_warm_wait;
-
-    if need_wait {
-        let deadline = Instant::now() + default_warm_wait;
-        loop {
-            tokio::time::sleep(MCP_INDEX_POLL_INTERVAL).await;
-
-            let status = index_engine.repo_status(repo).await;
-            if is_resolve_edges_status(status.as_ref()) {
-                return do_vector_only_query(
-                    index_engine,
-                    repo_dbs,
-                    settings,
-                    information_request,
-                    repo,
-                )
-                .await;
-            }
-            let state = status.as_ref().map(|s| s.state.clone());
-            let err_msg = status.as_ref().and_then(|s| s.error.clone());
-
-            match state {
-                Some(IndexState::Idle) => {
-                    // Success — proceed to query with fresh results. Bound any
-                    // cold-shard warm by the original MCP wait budget instead of
-                    // starting a second full wait window.
-                    query_warm_wait = deadline
-                        .checked_duration_since(Instant::now())
-                        .unwrap_or(Duration::ZERO);
-                    break;
-                }
-                Some(IndexState::Error) => {
-                    // Indexing failed — return immediately without burning the budget.
-                    let err = err_msg.unwrap_or_else(|| "unknown error".to_string());
-                    if readiness.serves_existing_index() {
-                        // Had usable data before — run query with stale data + note.
-                        let prefix = format!(
-                            "(index refresh failed: {}; showing previous results)\n\n",
-                            err
-                        );
-                        return format!(
-                            "{}{}",
-                            prefix,
-                            do_query(
-                                index_engine,
-                                repo_dbs,
-                                settings,
-                                information_request,
-                                repo,
-                                QueryGraphMode::Full,
-                                deadline
-                                    .checked_duration_since(Instant::now())
-                                    .unwrap_or(Duration::ZERO),
-                            )
-                            .await
-                        );
-                    } else {
-                        return crate::prompts::render(
-                            crate::prompts::MCP_DEGRADE_INDEX_FAILED,
-                            &[("err", &err.to_string())],
-                        );
-                    }
-                }
-                _ => {
-                    // Still indexing.
-                    if Instant::now() >= deadline {
-                        // During Embedding the resident shard is intentionally
-                        // evicted and warm is fenced. Querying with ZERO here would
-                        // either return empty or race partially-written rows. Only
-                        // ResolveEdges is query-ready (handled above).
-                        return crate::prompts::MCP_DEGRADE_INDEXING.to_string();
-                    }
-                }
-            }
+    // 4. One shared readiness decision selects both the wait budget and graph
+    // mode. MCP and REST therefore cannot drift on the ResolveEdges fast path.
+    let (query_graph_mode, query_warm_wait, output_prefix) = match readiness::await_index_ready(
+        settings,
+        index_engine,
+        repo_dbs,
+        data_dir,
+        repo,
+    )
+    .await
+    {
+        readiness::IndexReadiness::Ready { warm_budget } => (QueryGraphMode::Full, warm_budget, ""),
+        readiness::IndexReadiness::ReadyVectorOnly { warm_budget } => (
+            QueryGraphMode::VectorOnly,
+            warm_budget,
+            crate::prompts::MCP_GRAPH_PENDING,
+        ),
+        readiness::IndexReadiness::Timeout => {
+            return crate::prompts::MCP_DEGRADE_INDEXING.to_string();
         }
-    }
+        readiness::IndexReadiness::Failed(error) => {
+            let message = format!("{error:#}");
+            return crate::prompts::render(
+                crate::prompts::MCP_DEGRADE_INDEX_FAILED,
+                &[("err", &message)],
+            );
+        }
+    };
 
-    do_query(
+    let output = do_query(
         index_engine,
         repo_dbs,
         settings,
         information_request,
         repo,
-        QueryGraphMode::Full,
+        query_graph_mode,
         query_warm_wait,
     )
-    .await
+    .await;
+    format!("{output_prefix}{output}")
 }
 
 /// Build an augmented query string that prepends structured filter params as inline

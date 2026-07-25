@@ -25,14 +25,183 @@
 //! The returned [`QueryReadiness`] carries the resulting ACTION, so the caller
 //! does not re-derive booleans and cannot drift from the decision made here.
 
+use std::sync::Arc;
 use std::time::Duration;
 
-/// How often the MCP wait loop re-checks run status while blocked.
+use anyhow::Context;
+
+use crate::config::Settings;
+use crate::indexing::{IndexEngine, IndexPhase, IndexState, RepoStatus};
+use crate::store::{self, RepoDbMap};
+
+/// How often the shared index wait loop re-checks run status while blocked.
 ///
 /// Bounded well below `Settings::mcp_index_wait_secs` (the total budget) so the
 /// loop observes a state transition promptly without busy-spinning on the shared
 /// status map.
-pub(crate) const MCP_INDEX_POLL_INTERVAL: Duration = Duration::from_millis(500);
+pub(crate) const INDEX_READY_POLL_INTERVAL: Duration = Duration::from_millis(500);
+
+/// Warm budget granted to the vector-only fast path.
+///
+/// Phase 2 (`IndexPhase::ResolveEdges`) does not touch the vector shard, so the
+/// shard that is already resident is exactly what the query needs — there is
+/// nothing to wait for and blocking here would re-introduce the full-budget stall
+/// this fast path exists to avoid.
+pub(crate) const VECTOR_ONLY_WARM_BUDGET: Duration = Duration::ZERO;
+
+/// The single decision both query paths act on.
+///
+/// Carrying the graph mode AND the remaining warm budget in one value is what
+/// keeps REST and MCP from re-deriving the policy: a caller cannot accidentally
+/// query with the call graph while phase 2 is still resolving it, nor start a
+/// second full warm-wait window after the index wait already burned budget.
+#[derive(Debug)]
+pub(crate) enum IndexReadiness {
+    /// Complete index — query with the call graph. `warm_budget` is what remains
+    /// of `Settings::mcp_index_wait_secs` after any index wait.
+    Ready { warm_budget: Duration },
+    /// Chunks and vectors are durable but phase 2 is still resolving call edges.
+    /// Vector results are valid NOW; callers/callees are not yet available, so the
+    /// query must run in `QueryGraphMode::VectorOnly` and the surface must tell
+    /// the user the graph is pending.
+    ReadyVectorOnly { warm_budget: Duration },
+    /// The wait budget expired with a run still mid-flight. Nothing safe to serve.
+    Timeout,
+    /// The index run failed, or the repo DB could not be opened.
+    Failed(anyhow::Error),
+}
+
+impl IndexReadiness {
+    /// True when the query must skip call-graph expansion. Also the value the
+    /// REST layer reports as `graph_pending` so the UI can badge it.
+    #[cfg(test)]
+    pub(crate) fn graph_pending(&self) -> bool {
+        matches!(self, Self::ReadyVectorOnly { .. })
+    }
+
+    /// Graph mode selected by the readiness decision.
+    #[cfg(test)]
+    pub(crate) fn graph_mode(&self) -> crate::query::engine::QueryGraphMode {
+        match self {
+            Self::Ready { .. } => crate::query::engine::QueryGraphMode::Full,
+            Self::ReadyVectorOnly { .. } => crate::query::engine::QueryGraphMode::VectorOnly,
+            Self::Timeout | Self::Failed(_) => {
+                panic!("a non-queryable readiness has no graph mode")
+            }
+        }
+    }
+
+    /// Remaining budget for a cold-shard warm, or `None` when not queryable.
+    #[cfg(test)]
+    pub(crate) fn warm_budget(&self) -> Option<Duration> {
+        match self {
+            Self::Ready { warm_budget } | Self::ReadyVectorOnly { warm_budget } => {
+                Some(*warm_budget)
+            }
+            Self::Timeout | Self::Failed(_) => None,
+        }
+    }
+}
+
+/// True only while a run owns the repo AND is in phase 2 (edge resolution).
+///
+/// Phase 2 rewrites the `calls` table, never the chunks or the vector shard, so
+/// the shard is query-ready even though `RepoStatus.state` is still `Indexing`.
+/// `IndexState::Idle` with a stale `phase` is NOT phase 2 — the state field is
+/// what proves a run is live.
+pub(crate) fn is_resolve_edges_status(status: Option<&RepoStatus>) -> bool {
+    status.is_some_and(|s| s.state == IndexState::Indexing && s.phase == IndexPhase::ResolveEdges)
+}
+
+/// Ensure the repository index is queryable before a query starts, and say HOW
+/// it may be queried.
+///
+/// Both normal search and MCP call this exact helper, so the trigger/wait/degrade
+/// decision has one source of truth. It evaluates durable index state, triggers a
+/// run when necessary, and waits for the owning run to leave the destructive
+/// window — short-circuiting to [`IndexReadiness::ReadyVectorOnly`] whenever the
+/// run is merely resolving the call graph.
+pub(crate) async fn await_index_ready(
+    settings: &Settings,
+    index_engine: &Arc<IndexEngine>,
+    repo_dbs: &RepoDbMap,
+    data_dir: &std::path::Path,
+    repo: &str,
+) -> IndexReadiness {
+    let db = match store::get_or_open(repo_dbs, data_dir, repo, settings.repo_generation(repo))
+        .await
+        .context("failed to open repository index")
+    {
+        Ok(db) => db,
+        Err(error) => return IndexReadiness::Failed(error),
+    };
+    let chunk_count = store::ops::count_chunks(&db).await.unwrap_or(0);
+    let last_indexed_ts = store::ops::get_meta(&db, "last_indexed_at")
+        .await
+        .unwrap_or(None);
+    let status = index_engine.repo_status(repo).await;
+
+    // Phase 2 fast path, checked BEFORE the freshness policy: the vector shard is
+    // final for this run, so waiting for edge resolution would burn the whole
+    // budget for results that are already correct minus callers/callees.
+    if is_resolve_edges_status(status.as_ref()) {
+        return IndexReadiness::ReadyVectorOnly {
+            warm_budget: VECTOR_ONLY_WARM_BUDGET,
+        };
+    }
+
+    let readiness = evaluate(
+        &RepoIndexState {
+            run_state_is_indexing: status
+                .as_ref()
+                .is_some_and(|s| s.state == IndexState::Indexing),
+            repo_is_mutating: index_engine.repo_is_mutating(repo).await,
+            chunk_count,
+            last_indexed_ts: last_indexed_ts.as_deref(),
+        },
+        chrono::Duration::days(settings.mcp_stale_after_days as i64),
+    );
+
+    if readiness.requires_trigger()
+        && let Err(error) = index_engine.trigger_index(repo).await
+    {
+        return IndexReadiness::Failed(error);
+    }
+    let full_budget = Duration::from_secs(settings.mcp_index_wait_secs);
+    if !readiness.requires_wait() {
+        return IndexReadiness::Ready {
+            warm_budget: full_budget,
+        };
+    }
+
+    let deadline = tokio::time::Instant::now() + full_budget;
+    loop {
+        tokio::time::sleep(INDEX_READY_POLL_INTERVAL).await;
+        let status = index_engine.repo_status(repo).await;
+        // The run may reach phase 2 while we are blocked — take the fast path
+        // rather than waiting out edge resolution.
+        if is_resolve_edges_status(status.as_ref()) {
+            return IndexReadiness::ReadyVectorOnly {
+                warm_budget: VECTOR_ONLY_WARM_BUDGET,
+            };
+        }
+        match status.as_ref().map(|s| &s.state) {
+            Some(IndexState::Idle) => {
+                return IndexReadiness::Ready {
+                    warm_budget: deadline.saturating_duration_since(tokio::time::Instant::now()),
+                };
+            }
+            Some(IndexState::Error) => {
+                let error = status
+                    .and_then(|s| s.error)
+                    .unwrap_or_else(|| "unknown indexing error".to_string());
+                return IndexReadiness::Failed(anyhow::anyhow!("indexing failed: {error}"));
+            }
+            _ if tokio::time::Instant::now() >= deadline => return IndexReadiness::Timeout,
+            _ => {}
+        }
+    }
+}
 
 /// The four observed facts about a repo's index at query time. Borrowed rather
 /// than owned so the caller passes what it already read from the DB/engine.
@@ -136,6 +305,7 @@ pub(crate) fn evaluate(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::query::engine::QueryGraphMode;
 
     fn default_stale_threshold() -> chrono::Duration {
         chrono::Duration::days(crate::config::DEFAULT_MCP_STALE_AFTER_DAYS as i64)
@@ -326,8 +496,45 @@ mod tests {
     fn poll_interval_is_below_the_total_wait_budget() {
         let default_budget = Duration::from_secs(crate::config::DEFAULT_MCP_INDEX_WAIT_SECS);
         assert!(
-            MCP_INDEX_POLL_INTERVAL < default_budget,
+            INDEX_READY_POLL_INTERVAL < default_budget,
             "poll interval must fit many times inside the default wait budget"
         );
+    }
+
+    /// The enum is the contract both surfaces read. `graph_pending` must be set by
+    /// exactly one variant, and only the two queryable variants may hand back a
+    /// warm budget — a caller that got `Timeout`/`Failed` has nothing to query.
+    #[test]
+    fn readiness_variants_expose_graph_pending_and_budget() {
+        let budget = Duration::from_secs(7);
+
+        let ready = IndexReadiness::Ready {
+            warm_budget: budget,
+        };
+        assert!(!ready.graph_pending());
+        assert_eq!(ready.warm_budget(), Some(budget));
+        assert_eq!(ready.graph_mode(), QueryGraphMode::Full);
+
+        let vector_only = IndexReadiness::ReadyVectorOnly {
+            warm_budget: budget,
+        };
+        assert!(vector_only.graph_pending());
+        assert_eq!(vector_only.warm_budget(), Some(budget));
+        assert_eq!(vector_only.graph_mode(), QueryGraphMode::VectorOnly);
+
+        assert!(!IndexReadiness::Timeout.graph_pending());
+        assert_eq!(IndexReadiness::Timeout.warm_budget(), None);
+
+        let failed = IndexReadiness::Failed(anyhow::anyhow!("boom"));
+        assert!(!failed.graph_pending());
+        assert_eq!(failed.warm_budget(), None);
+    }
+
+    /// The vector-only path must not block: phase 2 leaves the shard resident and
+    /// final, so any nonzero budget here would re-introduce the stall this fast
+    /// path exists to remove.
+    #[test]
+    fn vector_only_budget_does_not_block() {
+        assert_eq!(VECTOR_ONLY_WARM_BUDGET, Duration::ZERO);
     }
 }

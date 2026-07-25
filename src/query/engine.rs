@@ -89,6 +89,13 @@ pub struct QueryResult {
     /// NOT "the index contains nothing". False for a genuine empty or a hit.
     #[serde(default)]
     pub warming: bool,
+    /// True when this query ran WITHOUT call-graph expansion because phase 2
+    /// (edge resolution) had not finished. The vector results are complete and
+    /// correct; only callers/callees are missing. Derived from the graph mode the
+    /// readiness gate selected, so the API surface cannot disagree with what the
+    /// pipeline actually did.
+    #[serde(default)]
+    pub graph_pending: bool,
 }
 
 // ─── DB row types ─────────────────────────────────────────────────────────
@@ -254,6 +261,7 @@ pub(crate) async fn run_query_with_filters_and_mode(
             },
             rerank: None,
             warming,
+            graph_pending: matches!(graph_mode, QueryGraphMode::VectorOnly),
         });
     }
 
@@ -297,6 +305,7 @@ pub(crate) async fn run_query_with_filters_and_mode(
             },
             rerank: None,
             warming: true,
+            graph_pending: matches!(graph_mode, QueryGraphMode::VectorOnly),
         });
     }
 
@@ -546,6 +555,7 @@ pub(crate) async fn run_query_with_filters_and_mode(
         },
         rerank: Some(rerank_info),
         warming,
+        graph_pending: matches!(graph_mode, QueryGraphMode::VectorOnly),
     })
 }
 

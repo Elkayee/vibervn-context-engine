@@ -1232,6 +1232,32 @@ async fn post_query(State(state): State<AppState>, Json(req): Json<QueryRequest>
         }
     };
 
+    let gate = crate::mcp::query_gate::rest_gate(
+        crate::mcp::readiness::await_index_ready(
+            &settings,
+            &state.index_engine,
+            &state.repo_dbs,
+            &state.data_dir,
+            repo_filter,
+        )
+        .await,
+    );
+    let (graph_mode, warm_budget, graph_pending) = if let Some(parts) = gate.query_parts() {
+        parts
+    } else {
+        let body = gate
+            .degrade_body()
+            .expect("degrades always have a JSON body");
+        let status = if matches!(gate, crate::mcp::query_gate::RestGate::Warming) {
+            StatusCode::from_u16(crate::mcp::query_gate::WARMING_STATUS)
+                .expect("WARMING_STATUS must be a valid HTTP status")
+        } else {
+            StatusCode::from_u16(crate::mcp::query_gate::INDEX_FAILED_STATUS)
+                .expect("INDEX_FAILED_STATUS must be a valid HTTP status")
+        };
+        return (status, Json(body)).into_response();
+    };
+
     // Delegate to the shared query op (VoyageClient build, optional LlmClient,
     // repo normalization, query::run_query with all settings-derived args) so the
     // CLI and server produce byte-identical retrieval. The `settings` snapshot was
@@ -1244,10 +1270,18 @@ async fn post_query(State(state): State<AppState>, Json(req): Json<QueryRequest>
         &req.query,
         req.top_k,
         req.rerank,
+        graph_mode,
+        warm_budget,
     )
     .await
     {
-        Ok(result) => Json(result).into_response(),
+        Ok(mut result) => {
+            // Keep the flag at the top level of the normal query JSON. The
+            // field is always present, so the UI can reserve badge space and
+            // transition visibility without shifting the results layout.
+            result.graph_pending = graph_pending;
+            Json(result).into_response()
+        }
         Err(e) => {
             let body = json!({ "error": format!("query failed: {e}") });
             (StatusCode::BAD_GATEWAY, Json(body)).into_response()

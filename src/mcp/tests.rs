@@ -5,27 +5,27 @@ use super::*;
 
 #[test]
 fn vector_only_fast_path_only_for_resolve_edges() {
-    let resolving = RepoStatus {
-        state: IndexState::Indexing,
-        phase: IndexPhase::ResolveEdges,
+    let resolving = crate::indexing::RepoStatus {
+        state: crate::indexing::IndexState::Indexing,
+        phase: crate::indexing::IndexPhase::ResolveEdges,
         ..Default::default()
     };
-    assert!(is_resolve_edges_status(Some(&resolving)));
+    assert!(readiness::is_resolve_edges_status(Some(&resolving)));
 
-    let embedding = RepoStatus {
-        state: IndexState::Indexing,
-        phase: IndexPhase::Embedding,
+    let embedding = crate::indexing::RepoStatus {
+        state: crate::indexing::IndexState::Indexing,
+        phase: crate::indexing::IndexPhase::Embedding,
         ..Default::default()
     };
-    assert!(!is_resolve_edges_status(Some(&embedding)));
+    assert!(!readiness::is_resolve_edges_status(Some(&embedding)));
 
-    let idle_resolve = RepoStatus {
-        state: IndexState::Idle,
-        phase: IndexPhase::ResolveEdges,
+    let idle_resolve = crate::indexing::RepoStatus {
+        state: crate::indexing::IndexState::Idle,
+        phase: crate::indexing::IndexPhase::ResolveEdges,
         ..Default::default()
     };
-    assert!(!is_resolve_edges_status(Some(&idle_resolve)));
-    assert!(!is_resolve_edges_status(None));
+    assert!(!readiness::is_resolve_edges_status(Some(&idle_resolve)));
+    assert!(!readiness::is_resolve_edges_status(None));
 }
 
 #[test]
