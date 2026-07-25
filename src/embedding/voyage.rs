@@ -34,6 +34,14 @@ impl Provider {
         }
     }
 
+    /// Canonical stable name used in persisted embedding identities.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Voyage => "voyage",
+            Self::OpenAI => "openai",
+        }
+    }
+
     fn default_endpoint(self) -> &'static str {
         match self {
             Self::Voyage => VOYAGE_ENDPOINT,
@@ -111,6 +119,10 @@ impl VoyageClient {
                 key_cursor: AtomicUsize::new(0),
             }),
         })
+    }
+
+    pub fn provider(&self) -> Provider {
+        self.inner.provider
     }
 
     pub fn model(&self) -> &str {

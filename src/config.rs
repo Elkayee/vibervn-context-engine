@@ -416,12 +416,17 @@ impl Default for LlmConfig {
     }
 }
 
+/// Default total MCP request budget for waiting on index completion.
+pub const DEFAULT_MCP_INDEX_WAIT_SECS: u64 = 50;
+/// Default age after which a committed index is considered stale by MCP.
+pub const DEFAULT_MCP_STALE_AFTER_DAYS: u64 = 7;
+
 fn default_mcp_index_wait_secs() -> u64 {
-    50
+    DEFAULT_MCP_INDEX_WAIT_SECS
 }
 
 fn default_mcp_stale_after_days() -> u64 {
-    7
+    DEFAULT_MCP_STALE_AFTER_DAYS
 }
 
 fn default_enabled_mcp_tools() -> Vec<String> {

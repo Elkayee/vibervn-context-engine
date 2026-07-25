@@ -821,7 +821,8 @@ async fn post_ignore_file(
     // 2. Evict vectors from the in-memory shard.
     {
         let mut vi = state.index_engine.vector_index.write().await;
-        vi.apply_incremental(&repo, &[file_path], &[], &[]);
+        let identity = vi.resident_identity(&repo).unwrap_or_default();
+        vi.apply_incremental(&repo, &[file_path], &[], identity, &[]);
     }
     // The shard changed → invalidate the persisted file so the next warm rebuilds it.
     {
@@ -985,7 +986,8 @@ async fn post_ignore_files(
         // 3. Evict this page's vectors from the in-memory shard.
         {
             let mut vi = state.index_engine.vector_index.write().await;
-            vi.apply_incremental(&repo, &abs_paths, &[], &[]);
+            let identity = vi.resident_identity(&repo).unwrap_or_default();
+            vi.apply_incremental(&repo, &abs_paths, &[], identity, &[]);
         }
 
         total += page_len;
