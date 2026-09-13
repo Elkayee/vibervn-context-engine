@@ -283,8 +283,9 @@ fn merge_content_fallback(originals: &[String]) -> String {
 pub struct CodebaseRetrievalArgs {
     /// Natural-language description of the code or information you are looking for.
     pub information_request: String,
-    /// Absolute path to the repository root. Must be a configured and indexed repository.
-    pub workspace_full_path: String,
+    /// Absolute path to the repository root. If omitted, automatically resolved dynamically.
+    #[serde(default)]
+    pub workspace_full_path: Option<String>,
     /// Optional: filter results to specific symbol kinds (e.g. ["function", "class"]).
     #[serde(default)]
     pub filter_kind: Option<Vec<String>>,
@@ -298,8 +299,9 @@ pub struct CodebaseRetrievalArgs {
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct FileRetrievalArgs {
-    /// Absolute path to the repository root.
-    pub workspace_full_path: String,
+    /// Absolute path to the repository root. If omitted, automatically resolved dynamically.
+    #[serde(default)]
+    pub workspace_full_path: Option<String>,
     /// Relative path to the file within the repository (e.g. "src/main.rs").
     pub file_path: String,
     /// Natural-language description of what you're looking for in this file.
@@ -363,6 +365,21 @@ impl McpHandler {
     ) -> Result<CallToolResult, ErrorData> {
         // Take an owned snapshot of settings — the guard is dropped before the .await below.
         let settings = self.settings.read().await.clone();
+
+        let repo = match crate::dynamic_workspace::tim_kho_tu_dong(
+            args.workspace_full_path.as_deref(),
+            None,
+            Some(&args.information_request),
+            &settings.repos,
+        ) {
+            Some(r) => r,
+            None => {
+                return Ok(CallToolResult::success(vec![Content::text(
+                    "Error: workspace_full_path is required or could not be dynamically resolved.".to_string(),
+                )]));
+            }
+        };
+
         // Build augmented query with structured filter params as inline prefixes
         let augmented_query = build_augmented_query(
             &args.information_request,
@@ -382,7 +399,7 @@ impl McpHandler {
                 &self.repo_dbs,
                 &settings,
                 &augmented_query,
-                &args.workspace_full_path,
+                &repo,
             ),
         )
         .await;
@@ -397,6 +414,21 @@ impl McpHandler {
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         let settings = self.settings.read().await.clone();
+
+        let repo = match crate::dynamic_workspace::tim_kho_tu_dong(
+            args.workspace_full_path.as_deref(),
+            Some(&args.file_path),
+            Some(&args.information_request),
+            &settings.repos,
+        ) {
+            Some(r) => r,
+            None => {
+                return Ok(CallToolResult::success(vec![Content::text(
+                    "Error: workspace_full_path is required or could not be dynamically resolved.".to_string(),
+                )]));
+            }
+        };
+
         let text = with_progress_heartbeat(
             ctx.peer,
             &ctx.meta,
@@ -406,7 +438,7 @@ impl McpHandler {
                 &self.data_dir,
                 &self.repo_dbs,
                 &settings,
-                &args.workspace_full_path,
+                &repo,
                 &args.file_path,
                 &args.information_request,
                 args.top_k.unwrap_or(5),
@@ -605,14 +637,19 @@ pub async fn run_codebase_retrieval(
     information_request: &str,
     workspace_full_path: &str,
 ) -> String {
-    // 1. Validate workspace_full_path.
-    let repo = workspace_full_path.trim();
-    if repo.is_empty() {
-        return "Error: workspace_full_path is required. Pass the full path to the workspace \
-                (repository) root directory."
-            .to_string();
-    }
-    let repo = &crate::store::normalize_repo_path(repo);
+    // 1. Validate or dynamically resolve workspace_full_path.
+    let repo_raw = workspace_full_path.trim();
+    let repo_buf = if repo_raw.is_empty() {
+        match crate::dynamic_workspace::tim_kho_tu_dong(None, None, Some(information_request), &settings.repos) {
+            Some(r) => r,
+            None => {
+                return "Error: workspace_full_path is required and could not be resolved automatically.".to_string();
+            }
+        }
+    } else {
+        crate::store::normalize_repo_path(repo_raw)
+    };
+    let repo = &repo_buf;
 
     // 2. Auto-register the repo if it is not yet configured.
     if !settings.repos.iter().any(|r| r == repo) {
@@ -914,11 +951,18 @@ pub async fn run_file_retrieval(
     information_request: &str,
     top_k: usize,
 ) -> String {
-    let repo = workspace_full_path.trim();
-    if repo.is_empty() {
-        return "Error: workspace_full_path is required.".to_string();
-    }
-    let repo = &crate::store::normalize_repo_path(repo);
+    let repo_raw = workspace_full_path.trim();
+    let repo_buf = if repo_raw.is_empty() {
+        match crate::dynamic_workspace::tim_kho_tu_dong(None, Some(file_path), Some(information_request), &settings.repos) {
+            Some(r) => r,
+            None => {
+                return "Error: workspace_full_path is required and could not be resolved automatically.".to_string();
+            }
+        }
+    } else {
+        crate::store::normalize_repo_path(repo_raw)
+    };
+    let repo = &repo_buf;
     let file_path = file_path.trim();
     if file_path.is_empty() {
         return "Error: file_path is required.".to_string();

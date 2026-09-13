@@ -1196,34 +1196,31 @@ async fn post_query(State(state): State<AppState>, Json(req): Json<QueryRequest>
     // subsequent .await calls (vector_index.read(), query::run_query, etc.).
     let settings = state.settings.read().await.clone();
 
-    // Pre-flight checks.
-    if settings.repos.is_empty() {
-        let body = json!({ "error": "No repositories configured. Add repos in Settings first." });
-        return (StatusCode::BAD_REQUEST, Json(body)).into_response();
-    }
+    // Dynamically resolve repository if omitted
+    let repo_resolved = match req.repo.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(r) => r.to_string(),
+        None => {
+            match crate::dynamic_workspace::tim_kho_tu_dong(None, None, Some(&req.query), &settings.repos) {
+                Some(r) => r,
+                None => {
+                    let body = json!({ "error": "A repository is required or could not be dynamically resolved. Pass `repo` with workspace path." });
+                    return (StatusCode::BAD_REQUEST, Json(body)).into_response();
+                }
+            }
+        }
+    };
+    let repo_filter = &repo_resolved;
 
-    // NOTE: we intentionally do NOT reject on an empty resident vector index here.
-    // Under per-repo sharding with lazy warming, a repo that IS indexed on disk can
-    // be momentarily cold (not yet warmed into RAM) — its shard reads empty. The
-    // query path handles this correctly: it returns partial (possibly empty) results
-    // and spawns a background warm, so the next query hits the now-resident shard.
-    // A hard "index is empty" rejection here would falsely block queries to
-    // populated-but-cold repos. Truly-unindexed setups simply return no results.
+    // Auto-register if not yet in settings.repos
+    if !settings.repos.iter().any(|r| r == repo_filter) {
+        let _ = crate::dynamic_workspace::dam_bao_kho_duoc_dang_ky(&state.home_dir, repo_filter).await;
+        state.index_engine.register_repo(repo_filter).await;
+    }
 
     if settings.embedding.api_keys.is_empty() {
         let body = json!({ "error": "No embedding API keys configured." });
         return (StatusCode::BAD_REQUEST, Json(body)).into_response();
     }
-
-    // A repo is mandatory: queries are always scoped to one repository. Reject a
-    // repo-less query rather than silently searching across every configured repo.
-    let repo_filter = match req.repo.as_deref().map(str::trim) {
-        Some(r) if !r.is_empty() => r,
-        _ => {
-            let body = json!({ "error": "A repository is required. Pass `repo` with the workspace path to scope the query." });
-            return (StatusCode::BAD_REQUEST, Json(body)).into_response();
-        }
-    };
 
     let gate = crate::mcp::query_gate::rest_gate(
         crate::mcp::readiness::await_index_ready(

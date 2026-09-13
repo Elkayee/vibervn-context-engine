@@ -3,6 +3,7 @@ pub mod assets;
 pub mod chat;
 pub mod config;
 pub mod defender;
+pub mod dynamic_workspace;
 pub mod embedding;
 pub mod engine_boot;
 pub mod engine_ops;

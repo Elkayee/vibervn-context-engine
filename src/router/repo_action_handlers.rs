@@ -94,13 +94,7 @@ async fn repo_delete_index_native(
     }
 }
 
-fn peek_body_field(bytes: &[u8], field: &str) -> Option<String> {
-    serde_json::from_slice::<serde_json::Value>(bytes)
-        .ok()?
-        .get(field)?
-        .as_str()
-        .map(str::to_string)
-}
+
 
 async fn proxy_by_body_field(state: &RouterState, field: &str, req: Request) -> Response {
     let (parts, body) = req.into_parts();
@@ -114,20 +108,42 @@ async fn proxy_by_body_field(state: &RouterState, field: &str, req: Request) -> 
                 .into_response();
         }
     };
-    let repo = match peek_body_field(&bytes, field).map(|repo| normalize_repo_path(repo.trim())) {
-        Some(repo) if !repo.is_empty() => repo,
-        _ => {
+
+    let mut body_val = serde_json::from_slice::<serde_json::Value>(&bytes).unwrap_or(json!({}));
+    let explicit_repo = body_val.get(field).and_then(|v| v.as_str()).map(str::to_string);
+    let query_hint = body_val.get("query").or_else(|| body_val.get("information_request")).and_then(|v| v.as_str());
+    let file_hint = body_val.get("file_path").or_else(|| body_val.get("file")).and_then(|v| v.as_str());
+
+    let settings = crate::config::ensure_dir_and_load(&state.home_dir).unwrap_or_default();
+    let repo = match crate::dynamic_workspace::tim_kho_tu_dong(
+        explicit_repo.as_deref(),
+        file_hint,
+        query_hint,
+        &settings.repos,
+    ) {
+        Some(r) => r,
+        None => {
             return (
                 StatusCode::BAD_REQUEST,
-                Json(json!({"error": format!("`{field}` is required to route the request to a repository worker")})),
+                Json(json!({"error": format!("`{field}` is required or could not be dynamically resolved")})),
             )
                 .into_response();
         }
     };
+
+    // Dam bao kho da duoc dang ky trong settings.json
+    let _ = crate::dynamic_workspace::dam_bao_kho_duoc_dang_ky(&state.home_dir, &repo).await;
+
+    // Chen repo da xac dinh vao body neu truoc do chua co
+    if body_val.get(field).is_none() || body_val.get(field).and_then(|v| v.as_str()).is_some_and(|s| s.trim().is_empty()) {
+        body_val[field] = json!(repo);
+    }
+    let new_bytes = serde_json::to_vec(&body_val).unwrap_or_else(|_| bytes.to_vec());
+
     acquire_and_proxy(
         &state.proxy,
         &repo,
-        Request::from_parts(parts, axum::body::Body::from(bytes)),
+        Request::from_parts(parts, axum::body::Body::from(new_bytes)),
     )
     .await
 }

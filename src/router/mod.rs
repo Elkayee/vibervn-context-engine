@@ -175,10 +175,12 @@ pub async fn build_router_app(opts: RouterBootOptions) -> Result<(Router, ProxyC
             ])
         }
     };
+    let home_dir_mcp = state.home_dir.clone();
     let mcp_service = StreamableHttpService::new(
         move || {
             Ok(mcp_proxy::ProxyMcpHandler::new(
                 mcp_proxy_ctx.clone(),
+                home_dir_mcp.clone(),
                 &enabled_tools,
             ))
         },

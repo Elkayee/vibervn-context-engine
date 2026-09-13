@@ -430,9 +430,8 @@ fn default_mcp_stale_after_days() -> u64 {
 }
 
 fn default_enabled_mcp_tools() -> Vec<String> {
-    // Only `codebase-retrieval` is on by default. `file-retrieval` is an
-    // advanced, opt-in tool — new installs must enable it explicitly in the UI.
-    vec!["codebase-retrieval".to_string()]
+    // Both codebase-retrieval and file-retrieval are enabled by default for zero-config agents.
+    vec!["codebase-retrieval".to_string(), "file-retrieval".to_string()]
 }
 
 /// A plan/key the user has bought (or claimed as a free trial) through the buy

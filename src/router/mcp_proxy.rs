@@ -29,7 +29,6 @@ use rmcp::{
 use serde_json::json;
 
 use super::proxy::{ProxyCtx, forward_json_to_worker};
-use crate::store::normalize_repo_path;
 
 /// Args for the proxied global `codebase-retrieval` tool. Mirrors
 /// `mcp::CodebaseRetrievalArgs` (the fields the funnel reads): the free-form
@@ -38,16 +37,17 @@ use crate::store::normalize_repo_path;
 pub struct ProxyCodebaseRetrievalArgs {
     /// Natural-language description of the code or information you are looking for.
     pub information_request: String,
-    /// Full path to the workspace/repository to search. Selects which worker
-    /// handles the call.
-    pub workspace_full_path: String,
+    /// Full path to the workspace/repository to search. If omitted, it is automatically resolved dynamically.
+    #[serde(default)]
+    pub workspace_full_path: Option<String>,
 }
 
 /// Args for the proxied global `file-retrieval` tool.
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct ProxyFileRetrievalArgs {
-    /// Full path to the workspace/repository. Selects which worker handles the call.
-    pub workspace_full_path: String,
+    /// Full path to the workspace/repository. If omitted, it is automatically resolved dynamically.
+    #[serde(default)]
+    pub workspace_full_path: Option<String>,
     /// Relative path to the file within the repository (e.g. "src/main.rs").
     pub file_path: String,
     /// Natural-language description of what you're looking for in this file.
@@ -61,13 +61,14 @@ pub struct ProxyFileRetrievalArgs {
 #[derive(Clone)]
 pub struct ProxyMcpHandler {
     proxy: ProxyCtx,
+    home_dir: std::path::PathBuf,
     #[allow(dead_code)]
     tool_router: ToolRouter<ProxyMcpHandler>,
 }
 
 #[tool_router]
 impl ProxyMcpHandler {
-    pub fn new(proxy: ProxyCtx, enabled_tools: &[String]) -> Self {
+    pub fn new(proxy: ProxyCtx, home_dir: std::path::PathBuf, enabled_tools: &[String]) -> Self {
         let all_tools: &[&str] = &["codebase-retrieval", "file-retrieval"];
         let mut router = Self::tool_router();
         for &name in all_tools {
@@ -77,6 +78,7 @@ impl ProxyMcpHandler {
         }
         Self {
             proxy,
+            home_dir,
             tool_router: router,
         }
     }
@@ -87,17 +89,35 @@ impl ProxyMcpHandler {
         &self,
         Parameters(args): Parameters<ProxyCodebaseRetrievalArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        let repo = normalize_repo_path(args.workspace_full_path.trim());
-        if repo.is_empty() {
-            return Ok(CallToolResult::success(vec![Content::text(
-                "Error: workspace_full_path is required.".to_string(),
-            )]));
-        }
-        // Forward to the worker's /api/mcp-tool — the SAME funnel run_codebase_
-        // retrieval the monolith MCP tool uses, so output is byte-identical.
+        let settings = match crate::config::ensure_dir_and_load(&self.home_dir) {
+            Ok(s) => s,
+            Err(e) => {
+                return Ok(CallToolResult::success(vec![Content::text(format!(
+                    "Error loading settings: {e}"
+                ))]));
+            }
+        };
+
+        let repo = match crate::dynamic_workspace::tim_kho_tu_dong(
+            args.workspace_full_path.as_deref(),
+            None,
+            Some(&args.information_request),
+            &settings.repos,
+        ) {
+            Some(r) => r,
+            None => {
+                return Ok(CallToolResult::success(vec![Content::text(
+                    "Error: workspace_full_path is required or could not be dynamically resolved.".to_string(),
+                )]));
+            }
+        };
+
+        // Tu dong dang ky repo vao settings.json neu chua co
+        let _ = crate::dynamic_workspace::dam_bao_kho_duoc_dang_ky(&self.home_dir, &repo).await;
+
         let body = json!({
             "information_request": args.information_request,
-            "workspace_full_path": args.workspace_full_path,
+            "workspace_full_path": repo,
         });
         let text = forward_json_to_worker(&self.proxy, &repo, "/api/mcp-tool", body)
             .await
@@ -111,14 +131,33 @@ impl ProxyMcpHandler {
         &self,
         Parameters(args): Parameters<ProxyFileRetrievalArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        let repo = normalize_repo_path(args.workspace_full_path.trim());
-        if repo.is_empty() {
-            return Ok(CallToolResult::success(vec![Content::text(
-                "Error: workspace_full_path is required.".to_string(),
-            )]));
-        }
+        let settings = match crate::config::ensure_dir_and_load(&self.home_dir) {
+            Ok(s) => s,
+            Err(e) => {
+                return Ok(CallToolResult::success(vec![Content::text(format!(
+                    "Error loading settings: {e}"
+                ))]));
+            }
+        };
+
+        let repo = match crate::dynamic_workspace::tim_kho_tu_dong(
+            args.workspace_full_path.as_deref(),
+            Some(&args.file_path),
+            Some(&args.information_request),
+            &settings.repos,
+        ) {
+            Some(r) => r,
+            None => {
+                return Ok(CallToolResult::success(vec![Content::text(
+                    "Error: workspace_full_path is required or could not be dynamically resolved.".to_string(),
+                )]));
+            }
+        };
+
+        let _ = crate::dynamic_workspace::dam_bao_kho_duoc_dang_ky(&self.home_dir, &repo).await;
+
         let body = json!({
-            "workspace_full_path": args.workspace_full_path,
+            "workspace_full_path": repo,
             "file_path": args.file_path,
             "information_request": args.information_request,
             "top_k": args.top_k,
