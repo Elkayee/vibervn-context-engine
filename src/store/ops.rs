@@ -161,6 +161,10 @@ pub struct FileMeta {
     /// `CHUNKER_VERSION` (>= 1), so legacy rows re-chunk on next trigger.
     #[serde(default, deserialize_with = "de_null_as_zero_i64")]
     pub chunker_version: i64,
+    #[serde(default)]
+    pub source_hash: Option<String>,
+    #[serde(default)]
+    pub notebook_cells: Option<Vec<crate::parsing::notebook::CellSource>>,
 }
 
 // ─── IndexMeta ────────────────────────────────────────────────────────────
@@ -540,7 +544,8 @@ pub async fn insert_edge(
 pub async fn upsert_file_meta(db: &Surreal<Db>, meta: &FileMeta) -> Result<()> {
     db.query(
         "UPSERT file_meta SET path = $path, mtime = $mtime, size = $size, repo = $repo, \
-         chunk_count = $chunk_count, chunker_version = $chunker_version WHERE path = $path",
+         chunk_count = $chunk_count, chunker_version = $chunker_version, \
+         source_hash = $source_hash, notebook_cells = $notebook_cells WHERE path = $path",
     )
     .bind(("path", meta.path.clone()))
     .bind(("mtime", meta.mtime))
@@ -548,6 +553,8 @@ pub async fn upsert_file_meta(db: &Surreal<Db>, meta: &FileMeta) -> Result<()> {
     .bind(("repo", meta.repo.clone()))
     .bind(("chunk_count", meta.chunk_count))
     .bind(("chunker_version", meta.chunker_version))
+    .bind(("source_hash", meta.source_hash.clone()))
+    .bind(("notebook_cells", meta.notebook_cells.clone()))
     .await
     .context("upsert file_meta")?;
 
@@ -559,7 +566,7 @@ pub async fn upsert_file_meta(db: &Surreal<Db>, meta: &FileMeta) -> Result<()> {
 /// Fetch all file_meta rows for a given repo.
 pub async fn get_all_file_meta(db: &Surreal<Db>, repo: &str) -> Result<Vec<FileMeta>> {
     let rows: Vec<FileMeta> = db
-        .query("SELECT path, mtime, size, repo, chunk_count, chunker_version FROM file_meta WHERE repo = $repo")
+        .query("SELECT path, mtime, size, repo, chunk_count, chunker_version, source_hash, notebook_cells FROM file_meta WHERE repo = $repo")
         .bind(("repo", repo.to_string()))
         .await
         .context("get all file_meta")?
@@ -921,6 +928,8 @@ mod paths_matching_filter_tests {
                     repo: repo.to_string(),
                     chunk_count: 1,
                     chunker_version: crate::parsing::chunker::CHUNKER_VERSION,
+                    source_hash: None,
+                    notebook_cells: None,
                 },
             )
             .await
@@ -1752,6 +1761,8 @@ mod null_chunk_count_deserialization {
             repo: "/repo/real_chunk_count_test".to_string(),
             chunk_count: 42,
             chunker_version: crate::parsing::chunker::CHUNKER_VERSION,
+            source_hash: None,
+            notebook_cells: None,
         };
         upsert_file_meta(&db, &meta).await.expect("upsert");
 
@@ -2099,6 +2110,8 @@ mod stats_cache_tests {
                 repo: repo.into(),
                 chunk_count: 2,
                 chunker_version: 1,
+                source_hash: None,
+                notebook_cells: None,
             },
         )
         .await
@@ -2112,6 +2125,8 @@ mod stats_cache_tests {
                 repo: repo.into(),
                 chunk_count: 1,
                 chunker_version: 1,
+                source_hash: None,
+                notebook_cells: None,
             },
         )
         .await
@@ -2241,6 +2256,8 @@ mod stats_cache_tests {
                 repo: repo.into(),
                 chunk_count: 1,
                 chunker_version: 1,
+                source_hash: None,
+                notebook_cells: None,
             },
         )
         .await
@@ -2266,6 +2283,8 @@ mod stats_cache_tests {
                 repo: repo.into(),
                 chunk_count: 2,
                 chunker_version: 1,
+                source_hash: None,
+                notebook_cells: None,
             },
         )
         .await

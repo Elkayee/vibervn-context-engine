@@ -1202,7 +1202,12 @@ async fn post_query(State(state): State<AppState>, Json(req): Json<QueryRequest>
     let repo_resolved = match req.repo.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
         Some(r) => r.to_string(),
         None => {
-            match crate::dynamic_workspace::tim_kho_tu_dong(None, None, Some(&req.query), &settings.repos) {
+            match crate::dynamic_workspace::tim_kho_tu_dong(
+                None,
+                None,
+                Some(&req.query),
+                &settings.repos,
+            ) {
                 Some(r) => r,
                 None => {
                     let body = json!({ "error": "A repository is required or could not be dynamically resolved. Pass `repo` with workspace path." });
@@ -1215,7 +1220,8 @@ async fn post_query(State(state): State<AppState>, Json(req): Json<QueryRequest>
 
     // Auto-register if not yet in settings.repos
     if !settings.repos.iter().any(|r| r == repo_filter) {
-        let _ = crate::dynamic_workspace::dam_bao_kho_duoc_dang_ky(&state.home_dir, repo_filter).await;
+        let _ =
+            crate::dynamic_workspace::dam_bao_kho_duoc_dang_ky(&state.home_dir, repo_filter).await;
         state.index_engine.register_repo(repo_filter).await;
     }
 
@@ -1272,6 +1278,7 @@ async fn post_query(State(state): State<AppState>, Json(req): Json<QueryRequest>
             // field is always present, so the UI can reserve badge space and
             // transition visibility without shifting the results layout.
             result.graph_pending = graph_pending;
+            crate::query::context::bound_query(&mut result);
             Json(result).into_response()
         }
         Err(e) => {

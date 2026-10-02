@@ -8,6 +8,7 @@ use tracing::debug;
 /// Extensions considered indexable code/config.
 pub const CODE_EXTENSIONS: &[&str] = &[
     "py",
+    "ipynb",
     "js",
     "ts",
     "tsx",

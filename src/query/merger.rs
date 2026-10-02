@@ -64,7 +64,15 @@ pub fn merge_chunks(chunks: Vec<MergeChunk>, top_k: usize) -> Vec<MergeChunk> {
         for next in file_chunks {
             if let Some(current) = merged.last_mut() {
                 // Merge condition: next starts within gap of 1 line from current end.
-                if next.line_start <= current.line_end + 2 {
+                if next.line_start <= current.line_end + 2
+                    && crate::parsing::notebook::same_cell(
+                        &current.file,
+                        current.line_start,
+                        current.line_end,
+                        next.line_start,
+                        next.line_end,
+                    )
+                {
                     let new_end = current.line_end.max(next.line_end);
                     let new_start = current.line_start;
                     // Cap at 60 lines.
@@ -140,6 +148,10 @@ pub fn merge_chunks(chunks: Vec<MergeChunk>, top_k: usize) -> Vec<MergeChunk> {
         b.score
             .partial_cmp(&a.score)
             .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.file.cmp(&b.file))
+            .then_with(|| a.line_start.cmp(&b.line_start))
+            .then_with(|| a.line_end.cmp(&b.line_end))
+            .then_with(|| a.content.cmp(&b.content))
     });
     result.truncate(top_k);
     result

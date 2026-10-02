@@ -1,5 +1,6 @@
 pub mod chunker;
 pub mod generated;
+pub mod notebook;
 pub mod relations;
 pub mod symbols;
 
@@ -110,6 +111,9 @@ pub struct ParseResult {
     pub chunks: Vec<Chunk>,
     /// Import map: local name → source file path (best-effort, only for resolved imports).
     pub imports: HashMap<String, String>,
+    pub source_hash: Option<String>,
+    pub notebook_cells: Vec<notebook::CellSource>,
+    pub error: Option<String>,
 }
 
 // ─── Language detection ───────────────────────────────────────────────────
@@ -141,6 +145,9 @@ pub enum Lang {
 }
 
 pub fn detect_language(path: &Path) -> Lang {
+    if notebook::is_notebook(&path.to_string_lossy()) {
+        return Lang::Python;
+    }
     match path.extension().and_then(|e| e.to_str()) {
         Some("py") => Lang::Python,
         Some("js" | "jsx" | "mjs" | "cjs") => Lang::JavaScript,
@@ -173,15 +180,36 @@ pub fn detect_language(path: &Path) -> Lang {
 /// Parse a source file and return symbols, edges, and chunks.
 /// Falls back to coverage-only chunks on parse failure.
 pub fn parse_file(file_path: &str, source: &str) -> ParseResult {
+    if notebook::is_notebook(file_path) {
+        return match notebook::from_source(file_path, source) {
+            Ok(snapshot) => {
+                let mut result = parse_source(file_path, &snapshot.content, Lang::Python);
+                result.chunks = snapshot.split_chunks(result.chunks);
+                result.source_hash = Some(snapshot.source_hash);
+                result.notebook_cells = snapshot.cells;
+                result
+            }
+            Err(error) => ParseResult {
+                symbols: vec![],
+                edges: vec![],
+                chunks: vec![],
+                imports: HashMap::new(),
+                source_hash: None,
+                notebook_cells: vec![],
+                error: Some(error.to_string()),
+            },
+        };
+    }
+    parse_source(file_path, source, detect_language(Path::new(file_path)))
+}
+
+fn parse_source(file_path: &str, source: &str, lang: Lang) -> ParseResult {
     // Reset recursion guard state for this file. This is the per-file parse entry
     // point — called from pipeline.rs par_iter (via parse_one_file) and from tests.
     // Rayon workers are reused across files; without per-file reset, the warn-once
     // flag and current-file path carry over from the previous file on the same
     // worker thread, suppressing diagnostics for new files.
     recursion_guard::begin_file(file_path);
-
-    let path = Path::new(file_path);
-    let lang = detect_language(path);
 
     let (symbols, edges, imports, chunks) = match lang {
         Lang::Python => {
@@ -367,6 +395,9 @@ pub fn parse_file(file_path: &str, source: &str) -> ParseResult {
         edges,
         chunks,
         imports,
+        source_hash: Some(notebook::hash(source.as_bytes())),
+        notebook_cells: vec![],
+        error: None,
     }
 }
 

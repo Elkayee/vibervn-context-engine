@@ -22,6 +22,8 @@ use crate::query::reranker;
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct CodeResult {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<crate::query::context::EvidenceSource>,
     pub file: String,
     pub line_start: u32,
     pub line_end: u32,
@@ -80,6 +82,9 @@ impl QueryGraphMode {
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct QueryResult {
+    pub budget: crate::query::context::ContextBudget,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
     pub results: Vec<CodeResult>,
     pub pre_rerank_results: Vec<CodeResult>,
     pub timing: QueryTiming,
@@ -96,6 +101,13 @@ pub struct QueryResult {
     /// pipeline actually did.
     #[serde(default)]
     pub graph_pending: bool,
+}
+
+impl QueryResult {
+    fn bounded(mut self) -> Self {
+        crate::query::context::bound_query(&mut self);
+        self
+    }
 }
 
 // ─── DB row types ─────────────────────────────────────────────────────────
@@ -249,6 +261,8 @@ pub(crate) async fn run_query_with_filters_and_mode(
 
     if raw_results.is_empty() {
         return Ok(QueryResult {
+            budget: Default::default(),
+            warnings: vec![],
             results: vec![],
             pre_rerank_results: vec![],
             timing: QueryTiming {
@@ -262,7 +276,8 @@ pub(crate) async fn run_query_with_filters_and_mode(
             rerank: None,
             warming,
             graph_pending: matches!(graph_mode, QueryGraphMode::VectorOnly),
-        });
+        }
+        .bounded());
     }
 
     // Apply repo filter.
@@ -280,7 +295,16 @@ pub(crate) async fn run_query_with_filters_and_mode(
     // This prevents holding the lock across graph expansion await points.
     let db_map: HashMap<String, Surreal<Db>> = {
         let guard = repo_dbs.read().await;
-        guard.clone()
+        guard
+            .iter()
+            .filter(|(repo, _)| {
+                repo_filter.is_none_or(|selected| {
+                    crate::store::normalize_repo_path(repo)
+                        == crate::store::normalize_repo_path(selected)
+                })
+            })
+            .map(|(repo, db)| (repo.clone(), db.clone()))
+            .collect()
     }; // read lock dropped HERE — before any async DB queries
 
     let fenced = hydrate_candidates(&db_map, &filtered).await;
@@ -293,6 +317,8 @@ pub(crate) async fn run_query_with_filters_and_mode(
     let mut base_chunks = fenced.kept;
     if base_chunks.is_empty() && fenced.dropped > 0 {
         return Ok(QueryResult {
+            budget: Default::default(),
+            warnings: fenced.warnings.clone(),
             results: vec![],
             pre_rerank_results: vec![],
             timing: QueryTiming {
@@ -306,7 +332,8 @@ pub(crate) async fn run_query_with_filters_and_mode(
             rerank: None,
             warming: true,
             graph_pending: matches!(graph_mode, QueryGraphMode::VectorOnly),
-        });
+        }
+        .bounded());
     }
 
     // ── Step 3.5: Apply query filters ────────────────────────────────────
@@ -349,6 +376,14 @@ pub(crate) async fn run_query_with_filters_and_mode(
 
     // ── Step 5: Merge ─────────────────────────────────────────────────────
     let merge_start = Instant::now();
+    let (all_chunks, mut source_warnings) =
+        crate::query::context::filter_sources(all_chunks, &db_map).await;
+    source_warnings.extend(fenced.warnings.iter().cloned());
+    source_warnings.sort();
+    source_warnings.dedup();
+    if !source_warnings.is_empty() {
+        warming = true;
+    }
     let merged = merge_chunks(all_chunks, top_k);
     let merge_ms = merge_start.elapsed().as_millis() as u64;
 
@@ -357,9 +392,17 @@ pub(crate) async fn run_query_with_filters_and_mode(
     // Reused for BOTH the rerank LLM payload and the final output — no double
     // read. `None` means the file could not be read (deleted/moved since index);
     // that chunk degrades to stored DB content and is never line-pruned.
+    let mut snapshots = HashMap::new();
     let numbered: Vec<Option<String>> = merged
         .iter()
-        .map(|c| read_lines_from_fs(&c.file, c.line_start, c.line_end).ok())
+        .map(|chunk| {
+            let snapshot = snapshots
+                .entry(chunk.file.clone())
+                .or_insert_with(|| crate::parsing::notebook::read(&chunk.file).ok());
+            snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.numbered(chunk.line_start, chunk.line_end).ok())
+        })
         .collect();
 
     // ── Step 5.5: Caller stats (bounded by top_k) ──────────────────────────
@@ -456,6 +499,7 @@ pub(crate) async fn run_query_with_filters_and_mode(
             (Some(text), Some(ranges)) if !ranges.is_empty() => {
                 for &(s, e) in ranges {
                     results.push(CodeResult {
+                        source: None,
                         file: chunk.file.clone(),
                         line_start: s,
                         line_end: e,
@@ -471,6 +515,7 @@ pub(crate) async fn run_query_with_filters_and_mode(
                 }
             }
             (Some(text), _) => results.push(CodeResult {
+                source: None,
                 file: chunk.file.clone(),
                 line_start: chunk.line_start,
                 line_end: chunk.line_end,
@@ -484,6 +529,7 @@ pub(crate) async fn run_query_with_filters_and_mode(
                 callees,
             }),
             (None, _) => results.push(CodeResult {
+                source: None,
                 file: chunk.file.clone(),
                 line_start: chunk.line_start,
                 line_end: chunk.line_end,
@@ -517,6 +563,7 @@ pub(crate) async fn run_query_with_filters_and_mode(
             (Some(s.caller_count), Some(s.caller_file_count))
         });
         pre_rerank_results.push(CodeResult {
+            source: None,
             file: chunk.file.clone(),
             line_start: chunk.line_start,
             line_end: chunk.line_end,
@@ -532,6 +579,11 @@ pub(crate) async fn run_query_with_filters_and_mode(
     }
 
     pre_rerank_results.retain(|r| !crate::query::content_fence::is_unresolved_content(&r.content));
+    if crate::query::context::attach_sources(&mut results, &db_map).await {
+        warming = true;
+        source_warnings.push("source changed during retrieval; rerun after reindex".into());
+    }
+    crate::query::context::attach_sources(&mut pre_rerank_results, &db_map).await;
 
     let total_ms = total_start.elapsed().as_millis() as u64;
 
@@ -543,6 +595,8 @@ pub(crate) async fn run_query_with_filters_and_mode(
     };
 
     Ok(QueryResult {
+        budget: Default::default(),
+        warnings: source_warnings,
         results,
         pre_rerank_results,
         timing: QueryTiming {
@@ -556,7 +610,8 @@ pub(crate) async fn run_query_with_filters_and_mode(
         rerank: Some(rerank_info),
         warming,
         graph_pending: matches!(graph_mode, QueryGraphMode::VectorOnly),
-    })
+    }
+    .bounded())
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────
@@ -605,7 +660,14 @@ pub(crate) async fn run_sub_query(
     // Clone DB handles then drop the read lock — no guard spans the await below.
     let db_map: HashMap<String, Surreal<Db>> = {
         let guard = repo_dbs.read().await;
-        guard.clone()
+        guard
+            .iter()
+            .filter(|(repo, _)| {
+                crate::store::normalize_repo_path(repo)
+                    == crate::store::normalize_repo_path(repo_filter)
+            })
+            .map(|(repo, db)| (repo.clone(), db.clone()))
+            .collect()
     };
 
     let base_chunks = hydrate_candidates(&db_map, &filtered).await.kept;
@@ -637,6 +699,7 @@ pub(crate) async fn run_sub_query(
         }
     }
 
+    let (all_chunks, _) = crate::query::context::filter_sources(all_chunks, &db_map).await;
     Ok(merge_chunks(all_chunks, top_k))
 }
 
@@ -1010,7 +1073,29 @@ pub(crate) async fn hydrate_candidates(
     candidates: &[crate::vector::SearchResult],
 ) -> crate::query::content_fence::ContentFence {
     let mut chunks = Vec::with_capacity(candidates.len());
+    let mut source_versions = HashMap::new();
+    let mut warnings = Vec::new();
     for sr in candidates {
+        if !source_versions.contains_key(&sr.chunk_id.file) {
+            source_versions.insert(
+                sr.chunk_id.file.clone(),
+                crate::query::context::source_problem(db_map, &sr.chunk_id.file).await,
+            );
+        }
+        if let Some(reason) = &source_versions[&sr.chunk_id.file] {
+            warnings.push(format!("{}: {reason}", sr.chunk_id.file));
+            chunks.push(MergeChunk {
+                file: sr.chunk_id.file.clone(),
+                line_start: sr.chunk_id.line_start,
+                line_end: sr.chunk_id.line_end,
+                score: sr.score,
+                content: String::new(),
+                symbol: None,
+                symbol_fqn: None,
+                symbol_kind: None,
+            });
+            continue;
+        }
         let (content, symbol, symbol_fqn, symbol_kind) = fetch_chunk_content(
             db_map,
             &sr.chunk_id.file,
@@ -1029,7 +1114,11 @@ pub(crate) async fn hydrate_candidates(
             symbol_kind,
         });
     }
-    crate::query::content_fence::apply(chunks)
+    let mut fenced = crate::query::content_fence::apply(chunks);
+    warnings.sort();
+    warnings.dedup();
+    fenced.warnings = warnings;
+    fenced
 }
 
 async fn fetch_chunk_content(
@@ -1117,20 +1206,7 @@ async fn fetch_symbol_kind(db: &Surreal<Db>, fqn: &str) -> Option<String> {
 /// Read lines [line_start, line_end] (1-based, inclusive) from the filesystem.
 /// Returns formatted numbered lines: "10: fn main() {\n11: ..."
 pub(crate) fn read_lines_from_fs(file: &str, line_start: u32, line_end: u32) -> Result<String> {
-    let content = std::fs::read_to_string(file)?;
-    let lines: Vec<&str> = content.lines().collect();
-    let start_idx = (line_start.saturating_sub(1)) as usize;
-    let end_idx = (line_end as usize).min(lines.len());
-    if start_idx >= lines.len() {
-        bail!("line_start {} out of range for file {}", line_start, file);
-    }
-    let numbered: String = lines[start_idx..end_idx]
-        .iter()
-        .enumerate()
-        .map(|(i, line)| format!("{}: {}", start_idx + i + 1, line))
-        .collect::<Vec<_>>()
-        .join("\n");
-    Ok(numbered)
+    crate::parsing::notebook::read(file)?.numbered(line_start, line_end)
 }
 
 /// Slice an already-numbered chunk text (produced by `read_lines_from_fs`,
