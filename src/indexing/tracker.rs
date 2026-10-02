@@ -64,7 +64,12 @@ pub fn detect_changes(
                 // file_meta with the new version as the crash-safe marker).
                 if stat.mtime != indexed_mtime
                     || stat.size != indexed_size
-                    || indexed_chunker_version != current_chunker_version
+                    || indexed_chunker_version
+                        != if crate::parsing::notebook::is_notebook(path) {
+                            crate::parsing::notebook::CHUNKER_VERSION
+                        } else {
+                            current_chunker_version
+                        }
                 {
                     changes.push(FileChange {
                         path: path.clone(),

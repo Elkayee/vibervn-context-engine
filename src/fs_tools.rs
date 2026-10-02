@@ -239,7 +239,9 @@ pub fn run_grep(
         }
 
         // Skip oversized files outright (generated bundles, blobs).
-        if std::fs::metadata(path).map(|m| m.len()).unwrap_or(0) > GREP_MAX_FILE_BYTES {
+        if !crate::parsing::notebook::is_notebook(&path.to_string_lossy())
+            && std::fs::metadata(path).map(|m| m.len()).unwrap_or(0) > GREP_MAX_FILE_BYTES
+        {
             continue;
         }
         let Ok(bytes) = std::fs::read(path) else {
@@ -251,6 +253,14 @@ pub fn run_grep(
         let Ok(text) = String::from_utf8(bytes) else {
             continue;
         };
+        let Ok(snapshot) = crate::parsing::notebook::from_source(&path.to_string_lossy(), &text)
+        else {
+            continue;
+        };
+        let text = snapshot.content;
+        if text.len() as u64 > GREP_MAX_FILE_BYTES {
+            continue;
+        }
 
         let rel_display = canon.strip_prefix(&canon_root).unwrap_or(&canon);
         let rel_str = rel_display.to_string_lossy().replace('\\', "/");
@@ -415,6 +425,10 @@ pub fn run_read(
     let text = match String::from_utf8(bytes) {
         Ok(t) => t,
         Err(_) => return ReadOutcome::err(format!("Error: file is not valid UTF-8: {file_path}")),
+    };
+    let text = match crate::parsing::notebook::from_source(&abs.to_string_lossy(), &text) {
+        Ok(snapshot) => snapshot.content,
+        Err(error) => return ReadOutcome::err(format!("Error: {error}")),
     };
 
     let lines: Vec<&str> = text.lines().collect();

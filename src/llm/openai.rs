@@ -243,7 +243,8 @@ pub async fn complete(
     let resp = match http
         .post(&url)
         .header("Authorization", format!("Bearer {api_key}"))
-        .json(&body)
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(crate::query::context::serialized_request(&body)?)
         .send()
         .await
     {
@@ -440,7 +441,8 @@ pub async fn complete_with_tools(
     let resp = match http
         .post(&url)
         .header("Authorization", format!("Bearer {api_key}"))
-        .json(&body)
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(crate::query::context::serialized_request(&body)?)
         .send()
         .await
     {
@@ -598,7 +600,8 @@ pub async fn complete_with_tools_streaming(
     let resp = match http
         .post(&url)
         .header("Authorization", format!("Bearer {api_key}"))
-        .json(&body)
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(crate::query::context::serialized_request(&body)?)
         .send()
         .await
     {

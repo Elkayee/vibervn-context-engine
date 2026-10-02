@@ -107,7 +107,8 @@ impl ProxyMcpHandler {
             Some(r) => r,
             None => {
                 return Ok(CallToolResult::success(vec![Content::text(
-                    "Error: workspace_full_path is required or could not be dynamically resolved.".to_string(),
+                    "Error: workspace_full_path is required or could not be dynamically resolved."
+                        .to_string(),
                 )]));
             }
         };
@@ -122,7 +123,7 @@ impl ProxyMcpHandler {
         let text = forward_json_to_worker(&self.proxy, &repo, "/api/mcp-tool", body)
             .await
             .unwrap_or_else(|e| format!("Error: {e}"));
-        Ok(CallToolResult::success(vec![Content::text(text)]))
+        Ok(crate::query::context::tool_result(text))
     }
 
     #[doc = include_str!("../prompts/mcp_file_retrieval.txt")]
@@ -149,7 +150,8 @@ impl ProxyMcpHandler {
             Some(r) => r,
             None => {
                 return Ok(CallToolResult::success(vec![Content::text(
-                    "Error: workspace_full_path is required or could not be dynamically resolved.".to_string(),
+                    "Error: workspace_full_path is required or could not be dynamically resolved."
+                        .to_string(),
                 )]));
             }
         };
@@ -165,7 +167,7 @@ impl ProxyMcpHandler {
         let text = forward_json_to_worker(&self.proxy, &repo, "/api/mcp-tool/file-retrieval", body)
             .await
             .unwrap_or_else(|e| format!("Error: {e}"));
-        Ok(CallToolResult::success(vec![Content::text(text)]))
+        Ok(crate::query::context::tool_result(text))
     }
 }
 

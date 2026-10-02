@@ -47,6 +47,7 @@ const MAX_FIRST_LINE_CHARS: usize = 120;
 /// A single result block ready for budget-aware assembly.
 #[derive(Default)]
 struct OutputBlock {
+    source: Option<crate::query::context::EvidenceSource>,
     header: String,
     content: String,
     file: String,
@@ -131,10 +132,10 @@ fn assemble_with_budget(blocks: &[OutputBlock]) -> String {
             truncated_count,
             blocks.len()
         );
-        out.push_str(&footer);
+        return crate::query::context::fit_mcp_text(&out, &footer);
     }
 
-    out
+    crate::query::context::fit_mcp_text(&out, "")
 }
 
 /// Merge output blocks from the same file whose line ranges overlap or are
@@ -188,7 +189,17 @@ fn merge_overlapping_blocks(blocks: Vec<OutputBlock>) -> Vec<OutputBlock> {
 
         for (orig_idx, mut next) in group {
             if let Some((min_idx, current, originals)) = merged.last_mut() {
-                if next.line_start <= current.line_end + 1 {
+                if next.line_start <= current.line_end + 1
+                    && current.source.as_ref().map(|source| &source.source_hash)
+                        == next.source.as_ref().map(|source| &source.source_hash)
+                    && crate::parsing::notebook::same_cell(
+                        &current.file,
+                        current.line_start,
+                        current.line_end,
+                        next.line_start,
+                        next.line_end,
+                    )
+                {
                     current.line_end = current.line_end.max(next.line_end);
                     *min_idx = (*min_idx).min(orig_idx);
                     // Combine caller/callee stats: the two merged blocks usually
@@ -223,16 +234,32 @@ fn merge_overlapping_blocks(blocks: Vec<OutputBlock>) -> Vec<OutputBlock> {
         for (_, block, originals) in &mut merged {
             if originals.len() > 1 {
                 // Multiple blocks were merged — try FS re-read for the full range.
-                match crate::query::engine::read_lines_from_fs(
-                    &block.file,
-                    block.line_start,
-                    block.line_end,
-                ) {
+                let reread = crate::parsing::notebook::read(&block.file).and_then(|snapshot| {
+                    if block
+                        .source
+                        .as_ref()
+                        .and_then(|source| source.source_hash.as_ref())
+                        .is_some_and(|expected| expected != &snapshot.source_hash)
+                    {
+                        anyhow::bail!("source changed during merge");
+                    }
+                    if let Some(source) = &mut block.source {
+                        if let Some(cell) = source.cells.first_mut() {
+                            let global_start = block.line_start - cell.line_start + 1;
+                            cell.line_end = block.line_end - global_start + 1;
+                        }
+                    }
+                    snapshot.numbered(block.line_start, block.line_end)
+                });
+                match reread {
                     Ok(text) => block.content = text,
                     Err(_) => {
                         // Fallback: union original content lines, dedup by
                         // line-number prefix, sort by line number.
                         block.content = merge_content_fallback(originals);
+                        if let Some(source) = &mut block.source {
+                            source.freshness = "changed_or_unavailable_during_merge".into();
+                        }
                     }
                 }
             }
@@ -241,8 +268,15 @@ fn merge_overlapping_blocks(blocks: Vec<OutputBlock>) -> Vec<OutputBlock> {
                 format_enriched_caller_tag(block.callers, &block.caller_names, block.caller_files);
             let callee_tag = format_enriched_callee_tag(block.callees, &block.callee_names);
             block.header = format!(
-                "{}#L{}-{}{}{}",
-                block.file, block.line_start, block.line_end, caller_tag, callee_tag
+                "{}{}{}",
+                crate::query::context::location(
+                    &block.file,
+                    block.line_start,
+                    block.line_end,
+                    block.source.as_ref()
+                ),
+                caller_tag,
+                callee_tag
             );
         }
 
@@ -375,7 +409,8 @@ impl McpHandler {
             Some(r) => r,
             None => {
                 return Ok(CallToolResult::success(vec![Content::text(
-                    "Error: workspace_full_path is required or could not be dynamically resolved.".to_string(),
+                    "Error: workspace_full_path is required or could not be dynamically resolved."
+                        .to_string(),
                 )]));
             }
         };
@@ -403,7 +438,7 @@ impl McpHandler {
             ),
         )
         .await;
-        Ok(CallToolResult::success(vec![Content::text(text)]))
+        Ok(crate::query::context::tool_result(text))
     }
 
     #[doc = include_str!("prompts/mcp_file_retrieval.txt")]
@@ -424,7 +459,8 @@ impl McpHandler {
             Some(r) => r,
             None => {
                 return Ok(CallToolResult::success(vec![Content::text(
-                    "Error: workspace_full_path is required or could not be dynamically resolved.".to_string(),
+                    "Error: workspace_full_path is required or could not be dynamically resolved."
+                        .to_string(),
                 )]));
             }
         };
@@ -445,7 +481,7 @@ impl McpHandler {
             ),
         )
         .await;
-        Ok(CallToolResult::success(vec![Content::text(text)]))
+        Ok(crate::query::context::tool_result(text))
     }
 }
 
@@ -543,7 +579,7 @@ impl RepoMcpHandler {
             ),
         )
         .await;
-        Ok(CallToolResult::success(vec![Content::text(text)]))
+        Ok(crate::query::context::tool_result(text))
     }
 
     #[doc = include_str!("prompts/mcp_file_retrieval_repo.txt")]
@@ -570,7 +606,7 @@ impl RepoMcpHandler {
             ),
         )
         .await;
-        Ok(CallToolResult::success(vec![Content::text(text)]))
+        Ok(crate::query::context::tool_result(text))
     }
 }
 
@@ -640,7 +676,12 @@ pub async fn run_codebase_retrieval(
     // 1. Validate or dynamically resolve workspace_full_path.
     let repo_raw = workspace_full_path.trim();
     let repo_buf = if repo_raw.is_empty() {
-        match crate::dynamic_workspace::tim_kho_tu_dong(None, None, Some(information_request), &settings.repos) {
+        match crate::dynamic_workspace::tim_kho_tu_dong(
+            None,
+            None,
+            Some(information_request),
+            &settings.repos,
+        ) {
             Some(r) => r,
             None => {
                 return "Error: workspace_full_path is required and could not be resolved automatically.".to_string();
@@ -871,6 +912,15 @@ async fn do_query(
             // decision is a pure function of (warming, empty, rerank_rejected) so it is
             // unit-tested directly (see select_empty_or_warming_message).
             if result.results.is_empty() {
+                if !result.warnings.is_empty() {
+                    return crate::query::context::fit_mcp_text(
+                        &format!(
+                            "Error: context source unavailable: {}",
+                            result.warnings.join("; ")
+                        ),
+                        "",
+                    );
+                }
                 let rerank_rejected = result.rerank.as_ref().is_some_and(|r| {
                     !r.fallback_used && r.skip_reason.is_none() && !r.raw_response.is_empty()
                 });
@@ -888,9 +938,17 @@ async fn do_query(
                         format_enriched_caller_tag(r.callers, &r.caller_names, r.caller_files);
                     let callee_tag = format_enriched_callee_tag(r.callees, &r.callee_names);
                     OutputBlock {
+                        source: r.source.clone(),
                         header: format!(
-                            "{}#L{}-{}{}{}",
-                            r.file, r.line_start, r.line_end, caller_tag, callee_tag
+                            "{}{}{}",
+                            crate::query::context::location(
+                                &r.file,
+                                r.line_start,
+                                r.line_end,
+                                r.source.as_ref()
+                            ),
+                            caller_tag,
+                            callee_tag
                         ),
                         content: r.content.clone(),
                         file: r.file.clone(),
@@ -914,7 +972,10 @@ async fn do_query(
             blocks.extend(generated);
             let assembled = assemble_with_budget(&blocks);
             if result.warming {
-                format!("{MCP_PARTIAL_RESULTS_PREFIX}{assembled}")
+                crate::query::context::fit_mcp_text(
+                    &format!("{MCP_PARTIAL_RESULTS_PREFIX}{assembled}"),
+                    "",
+                )
             } else {
                 assembled
             }
@@ -953,7 +1014,12 @@ pub async fn run_file_retrieval(
 ) -> String {
     let repo_raw = workspace_full_path.trim();
     let repo_buf = if repo_raw.is_empty() {
-        match crate::dynamic_workspace::tim_kho_tu_dong(None, Some(file_path), Some(information_request), &settings.repos) {
+        match crate::dynamic_workspace::tim_kho_tu_dong(
+            None,
+            Some(file_path),
+            Some(information_request),
+            &settings.repos,
+        ) {
             Some(r) => r,
             None => {
                 return "Error: workspace_full_path is required and could not be resolved automatically.".to_string();
@@ -970,6 +1036,10 @@ pub async fn run_file_retrieval(
     if information_request.trim().is_empty() {
         return "Error: information_request is required.".to_string();
     }
+    let guarded_file = match crate::fs_tools::resolve_within_root(Path::new(repo), file_path) {
+        Ok(file) => file,
+        Err(error) => return error,
+    };
 
     if settings.embedding.api_keys.is_empty() {
         return "Error: no embedding API keys configured.".to_string();
@@ -983,6 +1053,14 @@ pub async fn run_file_retrieval(
         };
 
     let db_key = build_db_key(repo, file_path);
+    let indexed = match crate::query::context::indexed_source(&db, &db_key).await {
+        Ok(source) => source,
+        Err(error) => return format!("Error: source version lookup failed: {error}"),
+    };
+    if let Err(error) = crate::query::context::validate_notebook(&db_key, &indexed) {
+        return format!("Error: {error}");
+    }
+    let _ = guarded_file;
 
     // Fetch all chunks for this file (with embeddings).
     let chunks = match chunks_for_file_with_embeddings(&db, &db_key).await {
@@ -1042,6 +1120,10 @@ pub async fn run_file_retrieval(
             symbol_kind: None,
         })
         .collect();
+
+    if let Err(error) = crate::query::context::validate_notebook(&db_key, &indexed) {
+        return format!("Error: {error}");
+    }
 
     // Read numbered content from disk for accurate reranker input.
     let numbered: Vec<Option<String>> = merge_chunks
@@ -1133,11 +1215,26 @@ pub async fn run_file_retrieval(
         return format!("No relevant chunks found for query in file: {file_path}");
     }
 
+    if let Err(error) = crate::query::context::validate_notebook(&db_key, &indexed) {
+        return format!("Error: {error}");
+    }
+    for block in &mut blocks {
+        block.source = Some(crate::query::context::evidence(
+            &db_key,
+            block.line_start,
+            block.line_end,
+            &indexed,
+        ));
+        block.header = crate::query::context::location(
+            &db_key,
+            block.line_start,
+            block.line_end,
+            block.source.as_ref(),
+        );
+    }
     let blocks = merge_overlapping_blocks(blocks);
-    let mut out = assemble_with_budget(&blocks);
-    out.push_str(crate::prompts::MCP_FILE_RETRIEVAL_HINT);
-
-    out
+    let out = assemble_with_budget(&blocks);
+    crate::query::context::fit_mcp_text(&out, crate::prompts::MCP_FILE_RETRIEVAL_HINT)
 }
 
 struct FileChunkRow {

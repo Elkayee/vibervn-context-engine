@@ -127,6 +127,8 @@ struct ParsedFile {
     raw_edges: Vec<RawEdgeRecord>,
     mtime: i64,
     size: i64,
+    source_hash: Option<String>,
+    notebook_cells: Vec<crate::parsing::notebook::CellSource>,
     /// How long the parse took (for FileParsed event).
     parse_elapsed_ms: u64,
     /// When this ParsedFile was created (to measure queue wait in Stage 2).
@@ -143,6 +145,8 @@ struct EmbeddedFile {
     raw_edges: Vec<RawEdgeRecord>,
     mtime: i64,
     size: i64,
+    source_hash: Option<String>,
+    notebook_cells: Vec<crate::parsing::notebook::CellSource>,
     /// True if the API returned all-empty embeddings due to an error.
     embed_failed: bool,
     /// When this EmbeddedFile was created (to measure queue wait in Stage 3).
@@ -1637,6 +1641,8 @@ impl IndexPipeline {
                                         raw_edges: pf.raw_edges,
                                         mtime: pf.mtime,
                                         size: pf.size,
+                                        source_hash: pf.source_hash,
+                                        notebook_cells: pf.notebook_cells,
                                         embed_failed,
                                         created_at: Instant::now(),
                                         pipeline_start,
@@ -2010,7 +2016,9 @@ impl IndexPipeline {
                 // commit marker — written only after this file's chunks are
                 // durable (deferred until the chunk-batch flush below), so an
                 // interrupted re-chunk leaves the stale version and re-runs.
-                chunker_version: crate::parsing::chunker::CHUNKER_VERSION,
+                chunker_version: crate::parsing::notebook::chunker_version(&ef.path),
+                source_hash: ef.source_hash.clone(),
+                notebook_cells: (!ef.notebook_cells.is_empty()).then(|| ef.notebook_cells.clone()),
             });
 
             let store_elapsed_ms = store_start.elapsed().as_millis() as u64;
@@ -3478,6 +3486,13 @@ fn parse_one_file(file: &str) -> ParseOutput {
     };
 
     let result = parse_file(file, &source);
+    if let Some(reason) = result.error {
+        warn!(file = %file, error = %reason, "failed to parse notebook");
+        return ParseOutput::Skipped {
+            file: file.to_string(),
+            reason,
+        };
+    }
 
     // Convert raw edges to RawEdgeRecord for Phase 1 storage.
     let raw_edges: Vec<RawEdgeRecord> = result
@@ -3517,6 +3532,8 @@ fn parse_one_file(file: &str) -> ParseOutput {
         raw_edges,
         mtime,
         size,
+        source_hash: result.source_hash,
+        notebook_cells: result.notebook_cells,
         parse_elapsed_ms,
         created_at: Instant::now(),
     })

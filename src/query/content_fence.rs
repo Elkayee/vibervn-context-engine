@@ -40,6 +40,7 @@ pub struct ContentFence {
     pub kept: Vec<MergeChunk>,
     /// How many candidates were dropped because their content did not resolve.
     pub dropped: usize,
+    pub warnings: Vec<String>,
 }
 
 impl ContentFence {
@@ -68,6 +69,7 @@ pub fn apply(chunks: Vec<MergeChunk>) -> ContentFence {
     ContentFence {
         dropped: total - kept.len(),
         kept,
+        warnings: vec![],
     }
 }
 

@@ -128,6 +128,8 @@ DEFINE FIELD OVERWRITE chunk_count ON file_meta TYPE int;
 -- treated as modified by detect_changes and lazily re-chunked. No DB_SCHEMA_VERSION
 -- bump: this is a freshness marker, not a data migration.
 DEFINE FIELD OVERWRITE chunker_version ON file_meta TYPE int DEFAULT 0;
+DEFINE FIELD OVERWRITE source_hash ON file_meta TYPE option<string>;
+DEFINE FIELD OVERWRITE notebook_cells ON file_meta FLEXIBLE TYPE option<array<object>>;
 DEFINE INDEX IF NOT EXISTS idx_filemeta_path ON file_meta FIELDS path UNIQUE;
 
 DEFINE TABLE IF NOT EXISTS index_meta SCHEMAFULL;

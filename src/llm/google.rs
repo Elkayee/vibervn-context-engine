@@ -214,7 +214,8 @@ pub async fn complete(
 
     let resp = http
         .post(&url)
-        .json(&body)
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(crate::query::context::serialized_request(&body)?)
         .send()
         .await
         .context("Gemini HTTP request failed")?;
@@ -379,7 +380,8 @@ pub async fn complete_with_tools(
 
     let resp = http
         .post(&url)
-        .json(&body)
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(crate::query::context::serialized_request(&body)?)
         .send()
         .await
         .context("Gemini tool-calling HTTP request failed")?;
@@ -467,7 +469,13 @@ pub async fn complete_with_tools_streaming(
 
     let body = build_tool_request(system, contents, tools, temperature, force_tool_use);
 
-    let resp = match http.post(&url).json(&body).send().await {
+    let resp = match http
+        .post(&url)
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(crate::query::context::serialized_request(&body)?)
+        .send()
+        .await
+    {
         Ok(r) => r,
         Err(e) => {
             // NOTE: never log `url` — it carries the API key as a query param.
