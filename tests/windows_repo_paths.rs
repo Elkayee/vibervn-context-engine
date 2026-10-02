@@ -137,6 +137,53 @@ fn test_normalize_repo_path_device_paths() {
 }
 
 #[test]
+fn test_normalize_repo_path_drive_relative_and_whitespace() {
+    if !cfg!(windows) {
+        return;
+    }
+
+    assert_eq!(
+        normalize_repo_path(r"C:relative\folder"),
+        r"c:relative\folder"
+    );
+    assert_eq!(
+        normalize_repo_path(r"C:relative/folder"),
+        r"c:relative\folder"
+    );
+    assert_eq!(normalize_repo_path(r" leading\folder"), r" leading\folder");
+    assert_eq!(normalize_repo_path(r" leading/folder/"), r" leading\folder");
+}
+
+#[test]
+fn test_normalize_repo_path_verbatim_dot_space_and_relative_namespaces() {
+    if !cfg!(windows) {
+        return;
+    }
+
+    assert_eq!(normalize_repo_path(r"\\?\D:\repo "), r"\\?\d:\repo ");
+    assert_eq!(normalize_repo_path(r"\\?\D:\repo."), r"\\?\d:\repo.");
+    assert_eq!(normalize_repo_path(r"\\?\D:\foo.\bar"), r"\\?\d:\foo.\bar");
+    assert_eq!(normalize_repo_path(r"//?/D:/repo /"), r"\\?\d:\repo ");
+    assert_eq!(
+        normalize_repo_path(r"\\?\UNC\server\share\repo "),
+        r"\\?\unc\server\share\repo "
+    );
+    assert_eq!(
+        normalize_repo_path(r"\\?\UNC\server\share\repo."),
+        r"\\?\unc\server\share\repo."
+    );
+    assert_eq!(
+        normalize_repo_path(r"\\?\UNC\server\share.\dir"),
+        r"\\?\unc\server\share.\dir"
+    );
+    assert_eq!(
+        normalize_repo_path(r"\\?\D:relative\folder"),
+        r"\\?\d:relative\folder"
+    );
+    assert_eq!(normalize_repo_path(r"\\?\D:"), r"\\?\d:");
+}
+
+#[test]
 fn test_ensure_dir_and_load_deduplicates_settings_and_normalizes_generations() {
     if !cfg!(windows) {
         return;

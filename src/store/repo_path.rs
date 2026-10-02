@@ -7,14 +7,17 @@
 //!
 //! This module collapses equivalent lexical aliases on Windows to a single
 //! canonical identity while preserving UNC prefixes, valid drive-root semantics,
+//! verbatim namespaces when meaningful (trailing dots/spaces or verbatim relative),
 //! and Unix case-sensitivity.
 
 /// Normalize a repo path to a canonical form for use as a HashMap/gate key.
 /// On Windows:
-/// - Extended-length drive paths (`\\?\C:\foo`) collapse to plain drive paths (`c:\foo`).
-/// - Extended UNC paths (`\\?\UNC\server\share\foo`) collapse to ordinary UNC (`\\server\share\foo`).
+/// - Extended-length absolute drive paths (`\\?\C:\foo`) collapse to plain drive paths (`c:\foo`)
+///   unless segments have dot/space suffixes.
+/// - Extended UNC paths (`\\?\UNC\server\share\foo`) collapse to ordinary UNC (`\\server\share\foo`)
+///   unless segments have dot/space suffixes.
 /// - Repeated interior separators collapse to a single `\`.
-/// - Trailing separators are stripped (preserving `c:\` drive-root).
+/// - Trailing separators are stripped (preserving `c:\` drive-root and `c:` drive-relative).
 /// - Lowercased (NTFS is case-insensitive).
 /// On Unix: forward slashes only, trailing separators stripped (case-sensitive).
 pub fn normalize_repo_path(repo: &str) -> String {
@@ -27,67 +30,154 @@ pub fn normalize_repo_path(repo: &str) -> String {
 }
 
 fn normalize_windows_path(repo: &str) -> String {
-    let raw = repo.trim();
-    if raw.is_empty() {
+    if repo.is_empty() {
         return String::new();
     }
 
     // Check for extended-length prefix: \\?\ or //?/ (4 chars)
-    if is_verbatim_prefix(raw) {
-        let after_verbatim = &raw[4..];
+    if is_verbatim_prefix(repo) {
+        let after_verbatim = &repo[4..];
 
-        // Case 1: Extended UNC path: \\?\UNC\server\share\...
+        // Case 1: Extended UNC path: \\?\UNC\server\share\... or //?/unc/server/share/...
         if is_unc_prefix(after_verbatim) {
             let unc_body = &after_verbatim[4..];
-            return format_unc_path(unc_body);
+            let segments: Vec<String> = unc_body
+                .split(is_sep)
+                .filter(|seg| !seg.is_empty())
+                .map(|seg| seg.to_lowercase())
+                .collect();
+
+            if has_verbatim_dot_or_space_suffix(&segments) {
+                if segments.is_empty() {
+                    return r"\\?\unc\".to_string();
+                }
+                return format!(r"\\?\unc\{}", segments.join("\\"));
+            }
+
+            if segments.is_empty() {
+                return r"\\".to_string();
+            }
+            return format!(r"\\{}", segments.join("\\"));
         }
 
         // Case 2: Extended drive path: \\?\C:\...
         if is_drive_prefix(after_verbatim) {
-            return format_drive_path(after_verbatim);
+            let mut chars = after_verbatim.chars();
+            let drive_letter = chars.next().unwrap().to_ascii_lowercase();
+            chars.next(); // skip ':'
+            let after_colon: String = chars.collect();
+
+            let has_leading_sep = after_colon.chars().next().map(is_sep).unwrap_or(false);
+            let segments: Vec<String> = after_colon
+                .split(is_sep)
+                .filter(|seg| !seg.is_empty())
+                .map(|seg| seg.to_lowercase())
+                .collect();
+
+            // Only supported absolute-drive spelling (with leading separator after colon)
+            // and without dot/space suffixes can strip the verbatim prefix.
+            if has_leading_sep && !has_verbatim_dot_or_space_suffix(&segments) {
+                if segments.is_empty() {
+                    return format!("{drive_letter}:\\");
+                }
+                return format!("{drive_letter}:\\{}", segments.join("\\"));
+            }
+
+            // Otherwise, preserve verbatim namespace.
+            if has_leading_sep {
+                if segments.is_empty() {
+                    return format!(r"\\?\{drive_letter}:\");
+                }
+                return format!(r"\\?\{drive_letter}:\{}", segments.join("\\"));
+            } else if segments.is_empty() {
+                return format!(r"\\?\{drive_letter}:");
+            } else {
+                return format!(r"\\?\{drive_letter}:{}", segments.join("\\"));
+            }
         }
 
         // Case 3: Other device namespace (e.g. \\?\Volume{...}\...)
-        // Keep \\?\ prefix, normalize interior slashes and lowercase.
-        let body = normalize_slashes_and_segments(after_verbatim);
-        if body.is_empty() {
+        let segments: Vec<String> = after_verbatim
+            .split(is_sep)
+            .filter(|seg| !seg.is_empty())
+            .map(|seg| seg.to_lowercase())
+            .collect();
+        if segments.is_empty() {
             return r"\\?\".to_string();
         }
-        return format!(r"\\?\{body}");
+        return format!(r"\\?\{}", segments.join("\\"));
     }
 
     // Check for device prefix: \\.\ or //./ (4 chars)
-    if is_device_prefix(raw) {
-        let after_device = &raw[4..];
-        let body = normalize_slashes_and_segments(after_device);
-        if body.is_empty() {
+    if is_device_prefix(repo) {
+        let after_device = &repo[4..];
+        let segments: Vec<String> = after_device
+            .split(is_sep)
+            .filter(|seg| !seg.is_empty())
+            .map(|seg| seg.to_lowercase())
+            .collect();
+        if segments.is_empty() {
             return r"\\.\".to_string();
         }
-        return format!(r"\\.\{body}");
+        return format!(r"\\.\{}", segments.join("\\"));
     }
 
     // Case 4: Ordinary UNC path: \\server\share\... or //server/share/...
-    if is_unc_root(raw) {
-        let unc_body = &raw[2..];
-        return format_unc_path(unc_body);
+    if is_unc_root(repo) {
+        let unc_body = &repo[2..];
+        let segments: Vec<String> = unc_body
+            .split(is_sep)
+            .filter(|seg| !seg.is_empty())
+            .map(|seg| seg.to_lowercase())
+            .collect();
+        if segments.is_empty() {
+            return r"\\".to_string();
+        }
+        return format!(r"\\{}", segments.join("\\"));
     }
 
     // Case 5: Ordinary drive path: C:\... or C:...
-    if is_drive_prefix(raw) {
-        return format_drive_path(raw);
+    if is_drive_prefix(repo) {
+        let mut chars = repo.chars();
+        let drive_letter = chars.next().unwrap().to_ascii_lowercase();
+        chars.next(); // skip ':'
+        let after_colon: String = chars.collect();
+
+        let has_leading_sep = after_colon.chars().next().map(is_sep).unwrap_or(false);
+        let segments: Vec<String> = after_colon
+            .split(is_sep)
+            .filter(|seg| !seg.is_empty())
+            .map(|seg| seg.to_lowercase())
+            .collect();
+
+        if has_leading_sep {
+            if segments.is_empty() {
+                return format!("{drive_letter}:\\");
+            }
+            return format!("{drive_letter}:\\{}", segments.join("\\"));
+        } else if segments.is_empty() {
+            return format!("{drive_letter}:");
+        } else {
+            return format!("{drive_letter}:{}", segments.join("\\"));
+        }
     }
 
     // Case 6: Other relative or root-relative paths
-    let is_root_relative = raw.starts_with('\\') || raw.starts_with('/');
-    let body = normalize_slashes_and_segments(raw);
+    let is_root_relative = repo.starts_with('\\') || repo.starts_with('/');
+    let segments: Vec<String> = repo
+        .split(is_sep)
+        .filter(|seg| !seg.is_empty())
+        .map(|seg| seg.to_lowercase())
+        .collect();
+
     if is_root_relative {
-        if body.is_empty() {
+        if segments.is_empty() {
             "\\".to_string()
         } else {
-            format!("\\{body}")
+            format!("\\{}", segments.join("\\"))
         }
     } else {
-        body
+        segments.join("\\")
     }
 }
 
@@ -133,49 +223,8 @@ fn is_drive_prefix(s: &str) -> bool {
     first.is_ascii_alphabetic() && second == ':'
 }
 
-fn format_unc_path(unc_body: &str) -> String {
-    let segments: Vec<String> = unc_body
-        .split(|c| is_sep(c))
-        .filter(|seg| !seg.is_empty())
-        .map(|seg| seg.to_lowercase())
-        .collect();
-
-    if segments.is_empty() {
-        r"\\".to_string()
-    } else {
-        format!(r"\\{}", segments.join("\\"))
-    }
-}
-
-fn format_drive_path(drive_str: &str) -> String {
-    let mut chars = drive_str.chars();
-    let drive_letter = chars.next().unwrap().to_ascii_lowercase();
-    chars.next(); // skip ':'
-    let after_colon: String = chars.collect();
-
-    let has_leading_sep = after_colon.chars().next().map(is_sep).unwrap_or(false);
-    let segments: Vec<String> = after_colon
-        .split(|c| is_sep(c))
-        .filter(|seg| !seg.is_empty())
-        .map(|seg| seg.to_lowercase())
-        .collect();
-
-    if segments.is_empty() {
-        if has_leading_sep {
-            format!("{drive_letter}:\\")
-        } else {
-            format!("{drive_letter}:")
-        }
-    } else {
-        format!("{drive_letter}:\\{}", segments.join("\\"))
-    }
-}
-
-fn normalize_slashes_and_segments(s: &str) -> String {
-    let segments: Vec<String> = s
-        .split(|c| is_sep(c))
-        .filter(|seg| !seg.is_empty())
-        .map(|seg| seg.to_lowercase())
-        .collect();
-    segments.join("\\")
+fn has_verbatim_dot_or_space_suffix(segments: &[String]) -> bool {
+    segments
+        .iter()
+        .any(|seg| seg.ends_with(' ') || seg.ends_with('.'))
 }
