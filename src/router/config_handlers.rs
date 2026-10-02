@@ -45,11 +45,6 @@ async fn put_config(State(state): State<RouterState>, body: axum::body::Bytes) -
         }
     };
     settings.version = crate::config::CURRENT_VERSION;
-    settings.repos = settings
-        .repos
-        .iter()
-        .map(|r| normalize_repo_path(r))
-        .collect();
 
     // FIRST-ADD auto-index: capture the repo set BEFORE the write so we can diff
     // out repos that are genuinely NEW in this PUT. Read old from disk now —
@@ -58,14 +53,18 @@ async fn put_config(State(state): State<RouterState>, body: axum::body::Bytes) -
     // configured repo counts as new and gets its initial index (correct: "added
     // → it indexes itself"). Keyed by normalize_repo_path to match how repos are
     // stored + how the registry/worker key them.
-    let old_repos: std::collections::HashSet<String> = ensure_dir_and_load(&state.home_dir)
-        .map(|s| {
-            s.repos
-                .into_iter()
-                .map(|r| normalize_repo_path(&r))
-                .collect()
-        })
+    let old_settings = ensure_dir_and_load(&state.home_dir).ok();
+    let old_repos: std::collections::HashSet<String> = old_settings
+        .as_ref()
+        .map(|s| s.repos.iter().cloned().collect())
         .unwrap_or_default();
+
+    // SERVER-OWNED repo_generations: preserve from disk if present
+    if let Some(old) = old_settings {
+        settings.repo_generations = old.repo_generations;
+    }
+
+    crate::config::repo_paths::normalize_and_dedup_settings(&mut settings);
     let new_repos_snapshot = settings.repos.clone();
 
     let target = crate::config::config_path(&state.home_dir);
@@ -194,4 +193,3 @@ fn resolve_mcp_repo_name(home_dir: &std::path::Path, repo_name: &str) -> Option<
         .find(|r| crate::store::sanitize_repo_name(r) == repo_name)
         .map(|r| normalize_repo_path(r))
 }
-

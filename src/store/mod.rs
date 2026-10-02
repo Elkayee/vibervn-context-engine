@@ -1,4 +1,5 @@
 pub mod ops;
+pub mod repo_path;
 pub mod schema;
 
 use std::collections::HashMap;
@@ -35,18 +36,7 @@ pub const DB_SCHEMA_VERSION_KEY: &str = "db_schema_version";
 /// Shared, process-wide map of one open SurrealDB handle per repo path.
 pub type RepoDbMap = Arc<RwLock<HashMap<String, Surreal<Db>>>>;
 
-/// Normalize a repo path to a canonical form for use as a HashMap/gate key.
-/// On Windows: lowercase + backslash separators (NTFS is case-insensitive).
-/// On Unix: forward slashes only (case-sensitive filesystems — no case fold).
-/// Trailing separators are stripped on both platforms.
-pub fn normalize_repo_path(repo: &str) -> String {
-    let s = if cfg!(windows) {
-        repo.replace('/', "\\").to_lowercase()
-    } else {
-        repo.replace('\\', "/")
-    };
-    s.trim_end_matches(['/', '\\']).to_string()
-}
+pub use repo_path::normalize_repo_path;
 
 /// Sanitize a repo path to a safe directory name (max 64 chars).
 pub fn sanitize_repo_name(repo_path: &str) -> String {
